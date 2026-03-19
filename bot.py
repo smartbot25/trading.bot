@@ -1,5 +1,6 @@
 """
-Portfolio Bot PRO v3.0
+Portfolio Bot PRO v4.1
+Broker: TYBA
 """
 
 import os
@@ -31,6 +32,13 @@ log = logging.getLogger("Bot")
 DATA_FILE   = "data.json"
 ALERTS_FILE = "sent_alerts.json"
 
+NIVELES = {
+    "NVDA": {"sl": 156, "tp1": 214, "tp2": 250},
+    "TSLA": {"sl": 335, "tp1": 457, "tp2": 530},
+    "SPY" : {"sl": 578, "tp1": 788, "tp2": 900},
+    "QQQ" : {"sl": 519, "tp1": 708, "tp2": 820},
+}
+
 ACTIVOS = {
     "QQQ" : "qqq.us",
     "NVDA": "nvda.us",
@@ -38,24 +46,7 @@ ACTIVOS = {
     "SPY" : "spy.us",
 }
 
-BUY_LEVELS = {
-    "QQQ" : 580,
-    "NVDA": 170,
-    "TSLA": 360,
-    "SPY" : 600,
-}
-
-DISTRIBUTION = {
-    "QQQ" : 40,
-    "NVDA": 80,
-    "TSLA": 40,
-    "SPY" : 60,
-}
-
-STOP_LOSS_PCT = 0.88
-TP1_PCT       = 1.20
-TP2_PCT       = 1.35
-INTERVALO_SEG = 21600
+INTERVALO_SEG = 3600
 
 data_lock = threading.Lock()
 
@@ -65,9 +56,12 @@ def load_data():
             return json.load(f)
     except:
         return {
-            "cash": 250.0,
+            "cash": 0.0,
             "positions": {
-                "QQQ": {"buy_price": 604.8, "amount_usd": 30.0}
+                "NVDA": {"buy_price": 177.42, "shares": 0.62, "amount_usd": 110.0},
+                "SPY" : {"buy_price": 642.86, "shares": 0.14, "amount_usd": 90.0},
+                "TSLA": {"buy_price": 384.62, "shares": 0.13, "amount_usd": 50.0},
+                "QQQ" : {"buy_price": 604.80, "shares": 0.05, "amount_usd": 30.0},
             },
         }
 
@@ -123,14 +117,6 @@ def get_price(symbol_stooq):
         log.error(f"get_price({symbol_stooq}): {e}")
         return None
 
-def buy_keyboard(symbol, price, amount):
-    return {
-        "inline_keyboard": [[
-            {"text": f"Comprar ${amount}", "callback_data": f"BUY|{symbol}|{price}|{amount}"},
-            {"text": "Ignorar",            "callback_data": "IGNORE"},
-        ]]
-    }
-
 def mercado_abierto():
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5:
@@ -143,7 +129,7 @@ def cmd_status():
         positions = dict(data["positions"])
         cash      = data["cash"]
 
-    lines = ["<b>PORTAFOLIO</b>\n"]
+    lines = ["📊 <b>PORTAFOLIO COMPLETO</b>\n"]
     total_invertido = 0.0
     total_actual    = 0.0
 
@@ -152,27 +138,31 @@ def cmd_status():
             continue
         pos       = positions[sym]
         buy_price = pos["buy_price"]
+        shares    = pos["shares"]
         amount    = pos["amount_usd"]
         price     = get_price(stooq)
 
         if price is None:
-            lines.append(f"{sym}: sin datos")
+            lines.append(f"⚪ <b>{sym}</b>: sin datos")
             continue
 
-        shares   = amount / buy_price
         actual   = shares * price
         ganancia = actual - amount
         pct      = ((price - buy_price) / buy_price) * 100
         emoji    = "🟢" if pct >= 0 else "🔴"
+        niveles  = NIVELES.get(sym, {})
+        sl       = niveles.get("sl", 0)
+        tp1      = niveles.get("tp1", 0)
 
         total_invertido += amount
         total_actual    += actual
 
         lines.append(
-            f"{emoji} <b>{sym}</b>  ${price:.2f}\n"
-            f"   Compra: ${buy_price}  |  Shares: {shares:.4f}\n"
+            f"{emoji} <b>{sym}</b>  ${price:.2f}  ({pct:+.1f}%)\n"
+            f"   Compra: ${buy_price}  |  Shares: {shares}\n"
             f"   Invertido: ${amount:.2f}  Actual: ${actual:.2f}\n"
-            f"   P&L: {'+' if ganancia>=0 else ''}${ganancia:.2f} ({pct:+.1f}%)"
+            f"   P&L: {'+' if ganancia>=0 else ''}${ganancia:.2f}\n"
+            f"   🔴 SL: ${sl}  |  🟢 TP: ${tp1}"
         )
 
     pnl_total  = total_actual - total_invertido
@@ -185,25 +175,86 @@ def cmd_status():
         f"📈 <b>En mercado:</b> ${total_actual:.2f}",
         f"{'🟢' if pnl_total>=0 else '🔴'} <b>P&L total:</b> {'+' if pnl_total>=0 else ''}${pnl_total:.2f}",
         f"💼 <b>Patrimonio:</b> ${patrimonio:.2f}",
+        f"\n🕐 {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC",
     ]
     send("\n".join(lines))
 
-def cmd_cash():
-    with data_lock:
-        cash = data["cash"]
-    send(f"💵 <b>Efectivo disponible:</b> ${cash:.2f}")
+def cmd_niveles():
+    lines = ["📌 <b>NIVELES ACTUALES</b>\n"]
+    for sym, n in NIVELES.items():
+        lines.append(
+            f"<b>{sym}</b>\n"
+            f"   🔴 Stop Loss:     ${n['sl']}\n"
+            f"   🟢 Take Profit 1: ${n['tp1']}\n"
+            f"   🟢 Take Profit 2: ${n['tp2']}\n"
+        )
+    lines.append("Para cambiar: /setnivel NVDA sl 150")
+    send("\n".join(lines))
 
-def cmd_precio(symbol):
-    symbol = symbol.upper()
-    stooq  = ACTIVOS.get(symbol)
-    if not stooq:
-        send(f"Simbolo {symbol} no configurado. Disponibles: {', '.join(ACTIVOS)}")
+def cmd_setnivel(args):
+    parts = args.strip().split()
+    if len(parts) != 3:
+        send("Uso: /setnivel NVDA sl 150\nTipos: sl, tp1, tp2")
         return
-    price = get_price(stooq)
-    if price:
-        send(f"<b>{symbol}</b>  ${price:.2f}")
-    else:
-        send(f"No se pudo obtener precio de {symbol}.")
+    sym, tipo, valor = parts[0].upper(), parts[1].lower(), parts[2]
+    if sym not in NIVELES:
+        send(f"Simbolo {sym} no encontrado.")
+        return
+    if tipo not in ("sl", "tp1", "tp2"):
+        send("Tipo debe ser: sl, tp1 o tp2")
+        return
+    try:
+        NIVELES[sym][tipo] = float(valor)
+        send(f"✅ <b>{sym}</b> {tipo.upper()} actualizado a ${valor}")
+    except:
+        send("Valor invalido.")
+
+def cmd_update(args):
+    parts = args.strip().split()
+    if len(parts) != 4:
+        send(
+            "Uso: /update SIMBOLO PRECIO_COMPRA SHARES MONTO_USD\n"
+            "Ejemplo: /update NVDA 177.42 0.62 110"
+        )
+        return
+    sym = parts[0].upper()
+    try:
+        buy_price  = float(parts[1])
+        shares     = float(parts[2])
+        amount_usd = float(parts[3])
+    except:
+        send("Valores invalidos.")
+        return
+
+    with data_lock:
+        data["positions"][sym] = {
+            "buy_price" : buy_price,
+            "shares"    : shares,
+            "amount_usd": amount_usd,
+        }
+        save_data(data)
+
+    for k in list(sent_alerts):
+        if k.startswith(sym):
+            sent_alerts.discard(k)
+    save_alerts(sent_alerts)
+
+    send(
+        f"✅ <b>{sym} ACTUALIZADO</b>\n\n"
+        f"Precio compra: ${buy_price}\n"
+        f"Shares:        {shares}\n"
+        f"Monto:         ${amount_usd}"
+    )
+
+def cmd_setcash(args):
+    try:
+        amount = float(args.strip())
+        with data_lock:
+            data["cash"] = amount
+            save_data(data)
+        send(f"✅ Efectivo actualizado: ${amount:.2f}")
+    except:
+        send("Uso: /setcash 150.00")
 
 def cmd_sell(symbol):
     symbol = symbol.upper()
@@ -227,20 +278,62 @@ def cmd_sell(symbol):
         f"Efectivo actual:  ${data['cash']:.2f}"
     )
 
+def cmd_precio(symbol):
+    symbol = symbol.upper()
+    stooq  = ACTIVOS.get(symbol)
+    if not stooq:
+        send(f"Simbolo {symbol} no configurado.\nDisponibles: {', '.join(ACTIVOS)}")
+        return
+    price = get_price(stooq)
+    if price:
+        niveles  = NIVELES.get(symbol, {})
+        dist_sl  = ((price - niveles.get('sl', 0))  / price) * 100
+        dist_tp1 = ((niveles.get('tp1', 0) - price) / price) * 100
+        send(
+            f"📌 <b>{symbol}</b>  ${price:.2f}\n\n"
+            f"🔴 Stop Loss ${niveles.get('sl','-')}  ({dist_sl:+.1f}% desde aqui)\n"
+            f"🟢 Take Profit ${niveles.get('tp1','-')}  ({dist_tp1:+.1f}% hasta aqui)"
+        )
+    else:
+        send(f"No se pudo obtener precio de {symbol}.")
+
+def cmd_plan():
+    send(
+        "📅 <b>PLAN 7 DIAS</b>\n\n"
+        "✅ Solo observas\n"
+        "✅ No compras mas\n"
+        "✅ No vendes por miedo\n\n"
+        "❌ No mires cada minuto\n"
+        "❌ No intentes arreglar posiciones\n\n"
+        "<b>LECTURAS ACTUALES</b>\n"
+        "NVDA → bien posicionado\n"
+        "SPY  → te da estabilidad\n"
+        "TSLA → riesgo controlado\n"
+        "QQQ  → exposicion tech extra\n\n"
+        "💼 Esto ya es un portafolio serio."
+    )
+
 def cmd_reset_alertas():
     sent_alerts.clear()
     save_alerts(sent_alerts)
-    send("Alertas reiniciadas. Las senales volveran a dispararse.")
+    send("🔄 Alertas reiniciadas.")
 
 def cmd_help():
     send(
-        "<b>COMANDOS</b>\n\n"
-        "/status          portafolio con P&L\n"
-        "/cash            efectivo disponible\n"
-        "/precio QQQ      precio on-demand\n"
-        "/sell QQQ        cerrar posicion\n"
-        "/reset_alertas   limpiar alertas\n"
-        "/help            este mensaje"
+        "<b>COMANDOS DISPONIBLES</b>\n\n"
+        "📊 <b>INFO</b>\n"
+        "/status              portafolio completo\n"
+        "/precio NVDA         precio + SL y TP\n"
+        "/niveles             ver todos los niveles\n"
+        "/plan                recordatorio del plan\n\n"
+        "✏️ <b>ACTUALIZAR DATOS</b>\n"
+        "/update NVDA 177.42 0.62 110\n"
+        "/setnivel NVDA sl 150\n"
+        "/setcash 150         actualizar efectivo\n"
+        "/sell NVDA           cerrar posicion\n\n"
+        "⚙️ <b>SISTEMA</b>\n"
+        "/reset_alertas       limpiar alertas\n"
+        "/help                este mensaje"
     )
 
 def telegram_listener():
@@ -260,45 +353,28 @@ def telegram_listener():
             for upd in updates:
                 last_update = upd["update_id"] + 1
 
-                if "callback_query" in upd:
-                    cb    = upd["callback_query"]["data"]
-                    parts = cb.split("|")
-
-                    if parts[0] == "BUY" and len(parts) == 4:
-                        _, sym, price_s, amount_s = parts
-                        price_f  = float(price_s)
-                        amount_f = float(amount_s)
-
-                        with data_lock:
-                            if data["cash"] < amount_f:
-                                send(f"Efectivo insuficiente (${data['cash']:.2f})")
-                            else:
-                                data["positions"][sym] = {
-                                    "buy_price" : price_f,
-                                    "amount_usd": amount_f,
-                                }
-                                data["cash"] = round(data["cash"] - amount_f, 2)
-                                save_data(data)
-                                send(
-                                    f"✅ <b>COMPRA REGISTRADA — {sym}</b>\n\n"
-                                    f"Precio:  ${price_f}\n"
-                                    f"Monto:   ${amount_f}\n"
-                                    f"Efectivo restante: ${data['cash']:.2f}"
-                                )
-
                 if "message" in upd:
                     text = upd["message"].get("text", "").strip()
+                    log.info(f"Comando: {text}")
 
                     if text == "/status":
                         cmd_status()
-                    elif text == "/cash":
-                        cmd_cash()
+                    elif text == "/niveles":
+                        cmd_niveles()
+                    elif text == "/plan":
+                        cmd_plan()
                     elif text.startswith("/precio"):
                         p = text.split()
-                        cmd_precio(p[1]) if len(p) >= 2 else send("Uso: /precio QQQ")
+                        cmd_precio(p[1]) if len(p) >= 2 else send("Uso: /precio NVDA")
+                    elif text.startswith("/update"):
+                        cmd_update(text[7:])
+                    elif text.startswith("/setnivel"):
+                        cmd_setnivel(text[9:])
+                    elif text.startswith("/setcash"):
+                        cmd_setcash(text[8:])
                     elif text.startswith("/sell"):
                         p = text.split()
-                        cmd_sell(p[1]) if len(p) >= 2 else send("Uso: /sell QQQ")
+                        cmd_sell(p[1]) if len(p) >= 2 else send("Uso: /sell NVDA")
                     elif text == "/reset_alertas":
                         cmd_reset_alertas()
                     elif text in ("/help", "/start"):
@@ -321,77 +397,101 @@ def market_loop():
 
         with data_lock:
             positions = dict(data["positions"])
-            cash      = data["cash"]
 
         for name, stooq in ACTIVOS.items():
+            if name not in positions:
+                continue
+
             price = get_price(stooq)
             if price is None:
                 continue
 
             log.info(f"{name}: ${price:.2f}")
 
-            if name in positions:
-                pos       = positions[name]
-                buy_price = pos["buy_price"]
-                amount    = pos["amount_usd"]
+            niveles   = NIVELES.get(name, {})
+            sl        = niveles.get("sl", 0)
+            tp1       = niveles.get("tp1", 0)
+            tp2       = niveles.get("tp2", 0)
+            pos       = positions[name]
+            buy_price = pos["buy_price"]
+            shares    = pos["shares"]
+            amount    = pos["amount_usd"]
+            actual    = shares * price
+            ganancia  = actual - amount
+            pct       = ((price - buy_price) / buy_price) * 100
 
-                stop = buy_price * STOP_LOSS_PCT
-                tp1  = buy_price * TP1_PCT
-                tp2  = buy_price * TP2_PCT
+            # ── STOP LOSS ─────────────────────────
+            if price <= sl and f"{name}_stop" not in sent_alerts:
+                send(
+                    f"🔴 <b>STOP LOSS — {name}</b>\n"
+                    f"VENDER TODO\n\n"
+                    f"Ve a TYBA y vende:\n"
+                    f"📌 <b>{shares} acciones</b>\n"
+                    f"💵 Recibirás aprox: <b>${actual:.2f}</b>\n\n"
+                    f"Precio actual: ${price:.2f}\n"
+                    f"Tu promedio:   ${buy_price}\n"
+                    f"Perdida:       ${ganancia:.2f} ({pct:+.1f}%)"
+                )
+                sent_alerts.add(f"{name}_stop")
+                save_alerts(sent_alerts)
 
-                if price <= stop and f"{name}_stop" not in sent_alerts:
-                    send(
-                        f"🔴 <b>STOP LOSS — {name}</b>\n"
-                        f"VENDER TODO\n\n"
-                        f"Precio actual: <b>${price:.2f}</b>\n"
-                        f"Tu promedio:   ${buy_price}\n"
-                        f"Perdida est.:  ${price*(amount/buy_price)-amount:.2f}"
-                    )
-                    sent_alerts.add(f"{name}_stop")
-                    save_alerts(sent_alerts)
+            # ── TAKE PROFIT 2 ─────────────────────
+            elif price >= tp2 and f"{name}_tp2" not in sent_alerts:
+                shares_vender = round(shares * 0.25, 4)
+                monto_vender  = round(actual * 0.25, 2)
+                send(
+                    f"🟢 <b>TAKE PROFIT 2 — {name}</b>\n"
+                    f"VENDER 25%\n\n"
+                    f"Ve a TYBA y vende:\n"
+                    f"📌 <b>{shares_vender} acciones</b>\n"
+                    f"💵 Recibirás aprox: <b>${monto_vender}</b>\n\n"
+                    f"Precio actual: ${price:.2f}\n"
+                    f"Ganancia:      +${ganancia:.2f} ({pct:+.1f}%)"
+                )
+                sent_alerts.add(f"{name}_tp2")
+                sent_alerts.add(f"{name}_tp1")
+                save_alerts(sent_alerts)
 
-                elif price >= tp2 and f"{name}_tp2" not in sent_alerts:
-                    send(
-                        f"🟢 <b>TAKE PROFIT 2 — {name}</b>\n"
-                        f"VENDER 25%\n\n"
-                        f"Precio actual: <b>${price:.2f}</b>\n"
-                        f"Vender aprox:  ${amount*0.25:.2f}"
-                    )
-                    sent_alerts.add(f"{name}_tp2")
-                    sent_alerts.add(f"{name}_tp1")
-                    save_alerts(sent_alerts)
+            # ── TAKE PROFIT 1 ─────────────────────
+            elif price >= tp1 and f"{name}_tp1" not in sent_alerts:
+                shares_vender = round(shares * 0.50, 4)
+                monto_vender  = round(actual * 0.50, 2)
+                send(
+                    f"🟢 <b>TAKE PROFIT 1 — {name}</b>\n"
+                    f"VENDER 50%\n\n"
+                    f"Ve a TYBA y vende:\n"
+                    f"📌 <b>{shares_vender} acciones</b>\n"
+                    f"💵 Recibirás aprox: <b>${monto_vender}</b>\n\n"
+                    f"Precio actual: ${price:.2f}\n"
+                    f"Ganancia:      +${ganancia:.2f} ({pct:+.1f}%)"
+                )
+                sent_alerts.add(f"{name}_tp1")
+                save_alerts(sent_alerts)
 
-                elif price >= tp1 and f"{name}_tp1" not in sent_alerts:
-                    send(
-                        f"🟢 <b>TAKE PROFIT 1 — {name}</b>\n"
-                        f"VENDER 50%\n\n"
-                        f"Precio actual: <b>${price:.2f}</b>\n"
-                        f"Vender aprox:  ${amount*0.50:.2f}"
-                    )
-                    sent_alerts.add(f"{name}_tp1")
-                    save_alerts(sent_alerts)
-
-            else:
-                target = BUY_LEVELS.get(name, 0)
-                budget = DISTRIBUTION.get(name, 0)
-                key    = f"{name}_buy_{target}"
-
-                if price <= target and cash >= budget and key not in sent_alerts:
-                    send(
-                        f"🟢 <b>COMPRAR — {name}</b>\n\n"
-                        f"Precio actual: <b>${price:.2f}</b>\n"
-                        f"Nivel objetivo: ${target}\n"
-                        f"Monto sugerido: ${budget}",
-                        buy_keyboard(name, price, budget),
-                    )
-                    sent_alerts.add(key)
-                    save_alerts(sent_alerts)
+            # ── ALERTA PROXIMIDAD SL ──────────────
+            dist_sl = ((price - sl) / price) * 100
+            if 0 < dist_sl <= 10 and f"{name}_cerca_sl" not in sent_alerts:
+                send(
+                    f"⚠️ <b>CERCA DEL STOP LOSS — {name}</b>\n\n"
+                    f"Precio actual: <b>${price:.2f}</b>\n"
+                    f"Stop Loss:     ${sl}\n"
+                    f"Distancia:     {dist_sl:.1f}%\n\n"
+                    f"Mantente atento."
+                )
+                sent_alerts.add(f"{name}_cerca_sl")
+                save_alerts(sent_alerts)
 
         time.sleep(INTERVALO_SEG)
 
 if __name__ == "__main__":
-    log.info("Bot iniciado")
-    send("🚀 <b>Portfolio Bot PRO v3.0</b> activo\nEscribe /help para ver los comandos.")
+    log.info("Bot v4.1 iniciado")
+    send(
+        "🚀 <b>Portfolio Bot PRO v4.1</b>\n\n"
+        "Monitoreando:\n"
+        "📌 NVDA | SPY | TSLA | QQQ\n\n"
+        "Escribe /status para ver tu portafolio\n"
+        "Escribe /help para todos los comandos"
+    )
 
     t = threading.Thread(target=telegram_listener, daemon=True)
     t.start()
@@ -400,4 +500,5 @@ if __name__ == "__main__":
         market_loop()
     except KeyboardInterrupt:
         log.info("Bot detenido.")
-        send("Bot detenido.")
+        send("⛔ Bot detenido.")
+
