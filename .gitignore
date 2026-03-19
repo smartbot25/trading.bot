@@ -1,0 +1,4 @@
+.env
+bot.log
+data.json
+sent_alerts.json
