@@ -1,6 +1,7 @@
 """
-Portfolio Bot PRO v4.1
+Portfolio Bot PRO v5.0
 Broker: TYBA
+Novedades: resumen diario automatico + alerta caida brusca -3%
 """
 
 import os
@@ -46,9 +47,14 @@ ACTIVOS = {
     "SPY" : "spy.us",
 }
 
-INTERVALO_SEG = 3600
+INTERVALO_SEG      = 3600   # chequeo cada 1 hora
+CAIDA_BRUSCA_PCT   = -3.0   # alerta si cae mas de 3% en el dia
+RESUMEN_HORA_UTC   = 20     # 4PM EST = 20:00 UTC (cierre NYSE)
 
 data_lock = threading.Lock()
+
+# control para resumen diario
+ultimo_resumen_dia = -1
 
 def load_data():
     try:
@@ -124,6 +130,69 @@ def mercado_abierto():
     hora = now.hour + now.minute / 60
     return 13.5 <= hora <= 20.0
 
+# ═════════════════════════════════════════
+#  RESUMEN DIARIO AUTOMATICO — 4PM EST
+# ═════════════════════════════════════════
+def enviar_resumen_diario():
+    with data_lock:
+        positions = dict(data["positions"])
+        cash      = data["cash"]
+
+    lines = ["📊 <b>RESUMEN DEL DIA</b>\n"]
+    total_invertido = 0.0
+    total_actual    = 0.0
+
+    for sym, stooq in ACTIVOS.items():
+        if sym not in positions:
+            continue
+        pos       = positions[sym]
+        buy_price = pos["buy_price"]
+        shares    = pos["shares"]
+        amount    = pos["amount_usd"]
+        price     = get_price(stooq)
+
+        if price is None:
+            lines.append(f"⚪ <b>{sym}</b>: sin datos")
+            continue
+
+        actual   = shares * price
+        ganancia = actual - amount
+        pct      = ((price - buy_price) / buy_price) * 100
+        emoji    = "🟢" if pct >= 0 else "🔴"
+        niveles  = NIVELES.get(sym, {})
+        sl       = niveles.get("sl", 0)
+        tp1      = niveles.get("tp1", 0)
+        dist_sl  = ((price - sl) / price) * 100
+
+        total_invertido += amount
+        total_actual    += actual
+
+        lines.append(
+            f"{emoji} <b>{sym}</b>  ${price:.2f}  ({pct:+.1f}%)\n"
+            f"   P&L: {'+' if ganancia>=0 else ''}${ganancia:.2f}\n"
+            f"   🔴 SL: ${sl} ({dist_sl:.1f}% lejos)  |  🟢 TP: ${tp1}"
+        )
+
+    pnl_total  = total_actual - total_invertido
+    patrimonio = total_actual + cash
+    emoji_total = "🟢" if pnl_total >= 0 else "🔴"
+
+    lines += [
+        "",
+        "─────────────────",
+        f"💵 <b>Efectivo:</b>   ${cash:.2f}",
+        f"📈 <b>En mercado:</b> ${total_actual:.2f}",
+        f"{emoji_total} <b>P&L total:</b> {'+' if pnl_total>=0 else ''}${pnl_total:.2f}",
+        f"💼 <b>Patrimonio:</b> ${patrimonio:.2f}",
+        "",
+        f"🕐 Cierre {datetime.now(timezone.utc).strftime('%d/%m/%Y')}",
+        "Hasta mañana. Mercado cerrado. 💪",
+    ]
+    send("\n".join(lines))
+
+# ═════════════════════════════════════════
+#  COMANDOS
+# ═════════════════════════════════════════
 def cmd_status():
     with data_lock:
         positions = dict(data["positions"])
@@ -336,6 +405,9 @@ def cmd_help():
         "/help                este mensaje"
     )
 
+# ═════════════════════════════════════════
+#  LISTENER TELEGRAM
+# ═════════════════════════════════════════
 def telegram_listener():
     last_update = None
     log.info("Listener iniciado.")
@@ -384,10 +456,24 @@ def telegram_listener():
             log.error(f"listener error: {e}")
             time.sleep(10)
 
+# ═════════════════════════════════════════
+#  MARKET LOOP
+# ═════════════════════════════════════════
 def market_loop():
+    global ultimo_resumen_dia
     log.info("Market loop iniciado.")
 
     while True:
+        now_utc = datetime.now(timezone.utc)
+
+        # ── RESUMEN DIARIO AL CIERRE 4PM EST ──────
+        if (now_utc.hour == RESUMEN_HORA_UTC and
+                now_utc.weekday() < 5 and
+                now_utc.day != ultimo_resumen_dia):
+            log.info("Enviando resumen diario...")
+            enviar_resumen_diario()
+            ultimo_resumen_dia = now_utc.day
+
         if not mercado_abierto():
             log.info("Mercado cerrado.")
             time.sleep(1800)
@@ -481,15 +567,33 @@ def market_loop():
                 sent_alerts.add(f"{name}_cerca_sl")
                 save_alerts(sent_alerts)
 
+            # ── CAIDA BRUSCA -3% EN EL DIA ────────
+            if pct <= CAIDA_BRUSCA_PCT and f"{name}_caida" not in sent_alerts:
+                send(
+                    f"📉 <b>CAIDA BRUSCA — {name}</b>\n\n"
+                    f"Precio actual: <b>${price:.2f}</b>\n"
+                    f"Caida desde tu compra: {pct:+.1f}%\n\n"
+                    f"🔴 Stop Loss en: ${sl}\n"
+                    f"Distancia al SL: {dist_sl:.1f}%\n\n"
+                    f"Mantente firme. No vendas por miedo.\n"
+                    f"Escribe /plan para recordar la estrategia."
+                )
+                sent_alerts.add(f"{name}_caida")
+                save_alerts(sent_alerts)
+
         time.sleep(INTERVALO_SEG)
 
+# ═════════════════════════════════════════
+#  ARRANQUE
+# ═════════════════════════════════════════
 if __name__ == "__main__":
-    log.info("Bot v4.1 iniciado")
+    log.info("Bot v5.0 iniciado")
     send(
-        "🚀 <b>Portfolio Bot PRO v4.1</b>\n\n"
+        "🚀 <b>Portfolio Bot PRO v5.0</b>\n\n"
         "Monitoreando:\n"
         "📌 NVDA | SPY | TSLA | QQQ\n\n"
-        "Escribe /status para ver tu portafolio\n"
+        "✅ Resumen diario automatico al cierre\n"
+        "✅ Alerta de caida brusca activada\n\n"
         "Escribe /help para todos los comandos"
     )
 
@@ -501,4 +605,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log.info("Bot detenido.")
         send("⛔ Bot detenido.")
-
