@@ -1,7 +1,7 @@
 """
-Portfolio Bot PRO v5.0
+Portfolio Bot PRO v6.0
 Broker: TYBA
-Novedades: resumen diario automatico + alerta caida brusca -3%
+Novedades: saldo TYBA + sugerencias de compra
 """
 
 import os
@@ -47,23 +47,33 @@ ACTIVOS = {
     "SPY" : "spy.us",
 }
 
-INTERVALO_SEG      = 3600   # chequeo cada 1 hora
-CAIDA_BRUSCA_PCT   = -3.0   # alerta si cae mas de 3% en el dia
-RESUMEN_HORA_UTC   = 20     # 4PM EST = 20:00 UTC (cierre NYSE)
+# Niveles de compra sugeridos por activo
+BUY_LEVELS = {
+    "QQQ" : 580,
+    "NVDA": 170,
+    "TSLA": 360,
+    "SPY" : 600,
+}
 
-data_lock = threading.Lock()
+INTERVALO_SEG    = 3600
+CAIDA_BRUSCA_PCT = -3.0
+RESUMEN_HORA_UTC = 20
 
-# control para resumen diario
+data_lock          = threading.Lock()
 ultimo_resumen_dia = -1
 
+# ─────────────────────────────────────────
+#  PERSISTENCIA
+# ─────────────────────────────────────────
 def load_data():
     try:
         with open(DATA_FILE, "r") as f:
             return json.load(f)
     except:
         return {
-            "cash": 0.0,
-            "positions": {
+            "cash"      : 0.0,    # efectivo registrado
+            "tyba_saldo": 0.0,    # dinero disponible en TYBA para invertir
+            "positions" : {
                 "NVDA": {"buy_price": 177.42, "shares": 0.62, "amount_usd": 110.0},
                 "SPY" : {"buy_price": 642.86, "shares": 0.14, "amount_usd": 90.0},
                 "TSLA": {"buy_price": 384.62, "shares": 0.13, "amount_usd": 50.0},
@@ -89,6 +99,9 @@ def save_alerts(a):
 data        = load_data()
 sent_alerts = load_alerts()
 
+# ─────────────────────────────────────────
+#  TELEGRAM
+# ─────────────────────────────────────────
 def send(msg, keyboard=None, retries=3):
     url     = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {
@@ -109,6 +122,9 @@ def send(msg, keyboard=None, retries=3):
                 time.sleep(4 * intento)
     return False
 
+# ─────────────────────────────────────────
+#  PRECIOS
+# ─────────────────────────────────────────
 def get_price(symbol_stooq):
     url = f"https://stooq.com/q/l/?s={symbol_stooq}&f=sd2t2ohlcv&h&e=csv"
     try:
@@ -123,6 +139,9 @@ def get_price(symbol_stooq):
         log.error(f"get_price({symbol_stooq}): {e}")
         return None
 
+# ─────────────────────────────────────────
+#  HORARIO NYSE
+# ─────────────────────────────────────────
 def mercado_abierto():
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5:
@@ -130,13 +149,39 @@ def mercado_abierto():
     hora = now.hour + now.minute / 60
     return 13.5 <= hora <= 20.0
 
-# ═════════════════════════════════════════
-#  RESUMEN DIARIO AUTOMATICO — 4PM EST
-# ═════════════════════════════════════════
+# ─────────────────────────────────────────
+#  SUGERENCIAS DE COMPRA SEGUN SALDO TYBA
+# ─────────────────────────────────────────
+def sugerencias_compra(price, saldo):
+    """Genera 3 opciones de compra segun el saldo disponible."""
+    if saldo <= 0:
+        return "   Sin saldo en TYBA. Usa /settyba para actualizar."
+
+    # opciones: 25%, 50% y 100% del saldo
+    opciones = [
+        round(saldo * 0.25, 2),
+        round(saldo * 0.50, 2),
+        round(saldo, 2),
+    ]
+    # eliminar duplicados y montos menores a $5
+    opciones = list(dict.fromkeys([o for o in opciones if o >= 5]))
+
+    lineas = []
+    for monto in opciones:
+        acciones = round(monto / price, 4)
+        etiqueta = "(todo)" if monto == round(saldo, 2) else ""
+        lineas.append(f"   ${monto:.2f} → {acciones} acciones {etiqueta}")
+
+    return "\n".join(lineas)
+
+# ─────────────────────────────────────────
+#  RESUMEN DIARIO AUTOMATICO
+# ─────────────────────────────────────────
 def enviar_resumen_diario():
     with data_lock:
-        positions = dict(data["positions"])
-        cash      = data["cash"]
+        positions   = dict(data["positions"])
+        cash        = data["cash"]
+        tyba_saldo  = data.get("tyba_saldo", 0.0)
 
     lines = ["📊 <b>RESUMEN DEL DIA</b>\n"]
     total_invertido = 0.0
@@ -159,9 +204,8 @@ def enviar_resumen_diario():
         ganancia = actual - amount
         pct      = ((price - buy_price) / buy_price) * 100
         emoji    = "🟢" if pct >= 0 else "🔴"
-        niveles  = NIVELES.get(sym, {})
-        sl       = niveles.get("sl", 0)
-        tp1      = niveles.get("tp1", 0)
+        sl       = NIVELES.get(sym, {}).get("sl", 0)
+        tp1      = NIVELES.get(sym, {}).get("tp1", 0)
         dist_sl  = ((price - sl) / price) * 100
 
         total_invertido += amount
@@ -173,14 +217,14 @@ def enviar_resumen_diario():
             f"   🔴 SL: ${sl} ({dist_sl:.1f}% lejos)  |  🟢 TP: ${tp1}"
         )
 
-    pnl_total  = total_actual - total_invertido
-    patrimonio = total_actual + cash
+    pnl_total   = total_actual - total_invertido
+    patrimonio  = total_actual + cash
     emoji_total = "🟢" if pnl_total >= 0 else "🔴"
 
     lines += [
         "",
         "─────────────────",
-        f"💵 <b>Efectivo:</b>   ${cash:.2f}",
+        f"💰 <b>Saldo TYBA:</b>  ${tyba_saldo:.2f}",
         f"📈 <b>En mercado:</b> ${total_actual:.2f}",
         f"{emoji_total} <b>P&L total:</b> {'+' if pnl_total>=0 else ''}${pnl_total:.2f}",
         f"💼 <b>Patrimonio:</b> ${patrimonio:.2f}",
@@ -195,8 +239,9 @@ def enviar_resumen_diario():
 # ═════════════════════════════════════════
 def cmd_status():
     with data_lock:
-        positions = dict(data["positions"])
-        cash      = data["cash"]
+        positions  = dict(data["positions"])
+        cash       = data["cash"]
+        tyba_saldo = data.get("tyba_saldo", 0.0)
 
     lines = ["📊 <b>PORTAFOLIO COMPLETO</b>\n"]
     total_invertido = 0.0
@@ -219,9 +264,8 @@ def cmd_status():
         ganancia = actual - amount
         pct      = ((price - buy_price) / buy_price) * 100
         emoji    = "🟢" if pct >= 0 else "🔴"
-        niveles  = NIVELES.get(sym, {})
-        sl       = niveles.get("sl", 0)
-        tp1      = niveles.get("tp1", 0)
+        sl       = NIVELES.get(sym, {}).get("sl", 0)
+        tp1      = NIVELES.get(sym, {}).get("tp1", 0)
 
         total_invertido += amount
         total_actual    += actual
@@ -235,18 +279,50 @@ def cmd_status():
         )
 
     pnl_total  = total_actual - total_invertido
-    patrimonio = total_actual + cash
+    patrimonio = total_actual + tyba_saldo
 
     lines += [
         "",
         "─────────────────",
-        f"💵 <b>Efectivo:</b>   ${cash:.2f}",
+        f"💰 <b>Saldo TYBA:</b>  ${tyba_saldo:.2f}",
         f"📈 <b>En mercado:</b> ${total_actual:.2f}",
         f"{'🟢' if pnl_total>=0 else '🔴'} <b>P&L total:</b> {'+' if pnl_total>=0 else ''}${pnl_total:.2f}",
         f"💼 <b>Patrimonio:</b> ${patrimonio:.2f}",
         f"\n🕐 {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC",
     ]
     send("\n".join(lines))
+
+def cmd_tyba():
+    """Ver saldo disponible en TYBA."""
+    with data_lock:
+        saldo = data.get("tyba_saldo", 0.0)
+    if saldo > 0:
+        send(
+            f"💰 <b>SALDO TYBA</b>\n\n"
+            f"Disponible para invertir: <b>${saldo:.2f}</b>\n\n"
+            f"Para actualizar: /settyba 150"
+        )
+    else:
+        send(
+            f"💰 <b>SALDO TYBA: $0.00</b>\n\n"
+            f"No tienes saldo registrado.\n"
+            f"Actualiza con: /settyba 150"
+        )
+
+def cmd_settyba(args):
+    """Actualizar saldo disponible en TYBA."""
+    try:
+        saldo = float(args.strip())
+        with data_lock:
+            data["tyba_saldo"] = saldo
+            save_data(data)
+        send(
+            f"✅ <b>Saldo TYBA actualizado</b>\n\n"
+            f"💰 Disponible para invertir: <b>${saldo:.2f}</b>\n\n"
+            f"El bot usara este monto para sugerirte cuanto comprar."
+        )
+    except:
+        send("Uso: /settyba 150.00")
 
 def cmd_niveles():
     lines = ["📌 <b>NIVELES ACTUALES</b>\n"]
@@ -344,7 +420,7 @@ def cmd_sell(symbol):
     send(
         f"✅ <b>POSICION CERRADA — {symbol}</b>\n\n"
         f"Monto recuperado: ${amount:.2f}\n"
-        f"Efectivo actual:  ${data['cash']:.2f}"
+        f"Recuerda actualizar tu saldo TYBA con /settyba"
     )
 
 def cmd_precio(symbol):
@@ -392,13 +468,14 @@ def cmd_help():
         "<b>COMANDOS DISPONIBLES</b>\n\n"
         "📊 <b>INFO</b>\n"
         "/status              portafolio completo\n"
+        "/tyba                ver saldo en TYBA\n"
         "/precio NVDA         precio + SL y TP\n"
         "/niveles             ver todos los niveles\n"
         "/plan                recordatorio del plan\n\n"
         "✏️ <b>ACTUALIZAR DATOS</b>\n"
+        "/settyba 150         saldo disponible en TYBA\n"
         "/update NVDA 177.42 0.62 110\n"
         "/setnivel NVDA sl 150\n"
-        "/setcash 150         actualizar efectivo\n"
         "/sell NVDA           cerrar posicion\n\n"
         "⚙️ <b>SISTEMA</b>\n"
         "/reset_alertas       limpiar alertas\n"
@@ -431,6 +508,8 @@ def telegram_listener():
 
                     if text == "/status":
                         cmd_status()
+                    elif text == "/tyba":
+                        cmd_tyba()
                     elif text == "/niveles":
                         cmd_niveles()
                     elif text == "/plan":
@@ -438,6 +517,8 @@ def telegram_listener():
                     elif text.startswith("/precio"):
                         p = text.split()
                         cmd_precio(p[1]) if len(p) >= 2 else send("Uso: /precio NVDA")
+                    elif text.startswith("/settyba"):
+                        cmd_settyba(text[8:])
                     elif text.startswith("/update"):
                         cmd_update(text[7:])
                     elif text.startswith("/setnivel"):
@@ -482,8 +563,33 @@ def market_loop():
         log.info("Chequeando mercado...")
 
         with data_lock:
-            positions = dict(data["positions"])
+            positions  = dict(data["positions"])
+            tyba_saldo = data.get("tyba_saldo", 0.0)
 
+        # ── OPORTUNIDADES DE COMPRA ────────────────
+        for name, stooq in ACTIVOS.items():
+            if name in positions:
+                continue  # ya tienes posicion
+
+            price  = get_price(stooq)
+            target = BUY_LEVELS.get(name, 0)
+            key    = f"{name}_buy_{target}"
+
+            if price and price <= target and key not in sent_alerts:
+                sugerencias = sugerencias_compra(price, tyba_saldo)
+                send(
+                    f"🟢 <b>OPORTUNIDAD DE COMPRA — {name}</b>\n\n"
+                    f"Precio actual: <b>${price:.2f}</b>\n"
+                    f"Nivel objetivo: ${target}\n\n"
+                    f"💰 Tienes en TYBA: ${tyba_saldo:.2f}\n"
+                    f"Sugerencias:\n{sugerencias}\n\n"
+                    f"Ve a TYBA y compra la cantidad que elijas.\n"
+                    f"Luego registra con /update {name} {price} SHARES MONTO"
+                )
+                sent_alerts.add(key)
+                save_alerts(sent_alerts)
+
+        # ── POSICIONES ABIERTAS ────────────────────
         for name, stooq in ACTIVOS.items():
             if name not in positions:
                 continue
@@ -494,10 +600,9 @@ def market_loop():
 
             log.info(f"{name}: ${price:.2f}")
 
-            niveles   = NIVELES.get(name, {})
-            sl        = niveles.get("sl", 0)
-            tp1       = niveles.get("tp1", 0)
-            tp2       = niveles.get("tp2", 0)
+            sl        = NIVELES.get(name, {}).get("sl", 0)
+            tp1       = NIVELES.get(name, {}).get("tp1", 0)
+            tp2       = NIVELES.get(name, {}).get("tp2", 0)
             pos       = positions[name]
             buy_price = pos["buy_price"]
             shares    = pos["shares"]
@@ -505,6 +610,7 @@ def market_loop():
             actual    = shares * price
             ganancia  = actual - amount
             pct       = ((price - buy_price) / buy_price) * 100
+            dist_sl   = ((price - sl) / price) * 100
 
             # ── STOP LOSS ─────────────────────────
             if price <= sl and f"{name}_stop" not in sent_alerts:
@@ -516,7 +622,8 @@ def market_loop():
                     f"💵 Recibirás aprox: <b>${actual:.2f}</b>\n\n"
                     f"Precio actual: ${price:.2f}\n"
                     f"Tu promedio:   ${buy_price}\n"
-                    f"Perdida:       ${ganancia:.2f} ({pct:+.1f}%)"
+                    f"Perdida:       ${ganancia:.2f} ({pct:+.1f}%)\n\n"
+                    f"Luego actualiza con /sell {name}"
                 )
                 sent_alerts.add(f"{name}_stop")
                 save_alerts(sent_alerts)
@@ -532,7 +639,8 @@ def market_loop():
                     f"📌 <b>{shares_vender} acciones</b>\n"
                     f"💵 Recibirás aprox: <b>${monto_vender}</b>\n\n"
                     f"Precio actual: ${price:.2f}\n"
-                    f"Ganancia:      +${ganancia:.2f} ({pct:+.1f}%)"
+                    f"Ganancia:      +${ganancia:.2f} ({pct:+.1f}%)\n\n"
+                    f"Luego actualiza shares con /update {name}"
                 )
                 sent_alerts.add(f"{name}_tp2")
                 sent_alerts.add(f"{name}_tp1")
@@ -549,13 +657,13 @@ def market_loop():
                     f"📌 <b>{shares_vender} acciones</b>\n"
                     f"💵 Recibirás aprox: <b>${monto_vender}</b>\n\n"
                     f"Precio actual: ${price:.2f}\n"
-                    f"Ganancia:      +${ganancia:.2f} ({pct:+.1f}%)"
+                    f"Ganancia:      +${ganancia:.2f} ({pct:+.1f}%)\n\n"
+                    f"Luego actualiza shares con /update {name}"
                 )
                 sent_alerts.add(f"{name}_tp1")
                 save_alerts(sent_alerts)
 
             # ── ALERTA PROXIMIDAD SL ──────────────
-            dist_sl = ((price - sl) / price) * 100
             if 0 < dist_sl <= 10 and f"{name}_cerca_sl" not in sent_alerts:
                 send(
                     f"⚠️ <b>CERCA DEL STOP LOSS — {name}</b>\n\n"
@@ -567,7 +675,7 @@ def market_loop():
                 sent_alerts.add(f"{name}_cerca_sl")
                 save_alerts(sent_alerts)
 
-            # ── CAIDA BRUSCA -3% EN EL DIA ────────
+            # ── CAIDA BRUSCA ──────────────────────
             if pct <= CAIDA_BRUSCA_PCT and f"{name}_caida" not in sent_alerts:
                 send(
                     f"📉 <b>CAIDA BRUSCA — {name}</b>\n\n"
@@ -587,14 +695,15 @@ def market_loop():
 #  ARRANQUE
 # ═════════════════════════════════════════
 if __name__ == "__main__":
-    log.info("Bot v5.0 iniciado")
+    log.info("Bot v6.0 iniciado")
     send(
-        "🚀 <b>Portfolio Bot PRO v5.0</b>\n\n"
+        "🚀 <b>Portfolio Bot PRO v6.0</b>\n\n"
         "Monitoreando:\n"
         "📌 NVDA | SPY | TSLA | QQQ\n\n"
-        "✅ Resumen diario automatico al cierre\n"
-        "✅ Alerta de caida brusca activada\n\n"
-        "Escribe /help para todos los comandos"
+        "✅ Saldo TYBA integrado\n"
+        "✅ Sugerencias de compra activadas\n\n"
+        "Primero dime cuanto tienes en TYBA:\n"
+        "/settyba 120"
     )
 
     t = threading.Thread(target=telegram_listener, daemon=True)
