@@ -1,224 +1,174 @@
 import os
+import time
 import json
-import logging
 import requests
-from datetime import datetime, timezone
-from dotenv import load_dotenv
+import telebot
+from telebot.types import ReplyKeyboardMarkup
 
-from telegram import ReplyKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-
-# ─────────────────────────────
-# CONFIG
-# ─────────────────────────────
-load_dotenv()
+# ================= CONFIG =================
 TOKEN = os.getenv("TOKEN")
+CHAT_ID = int(os.getenv("CHAT_ID"))
+
+bot = telebot.TeleBot(TOKEN)
 
 DATA_FILE = "data.json"
 
-logging.basicConfig(level=logging.INFO)
-
-# ─────────────────────────────
-# DATA
-# ─────────────────────────────
-DEFAULT_DATA = {
-    "saldo": 1.16,
-    "positions": {
-        "NVDA": {"buy": 178.41, "shares": 0.61},
-        "TSLA": {"buy": 382.06, "shares": 0.13},
-        "SPY":  {"buy": 657.52, "shares": 0.13},
-        "QQQ":  {"buy": 603.10, "shares": 0.05}
-    },
-    "historial": []
-}
-
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE) as f:
-            return json.load(f)
-    return DEFAULT_DATA
-
-def save_data(d):
-    with open(DATA_FILE, "w") as f:
-        json.dump(d, f, indent=2)
-
-# ─────────────────────────────
-# PRECIO (STOOQ)
-# ─────────────────────────────
-def get_price(symbol):
-    try:
-        url = f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
-        r = requests.get(url, timeout=10)
-        price = float(r.text.split("\n")[1].split(",")[6])
-        return price
-    except:
-        return None
-
-MAP = {
-    "NVDA": "nvda.us",
-    "TSLA": "tsla.us",
+SYMBOLS = {
+    "NVIDIA": "nvda.us",
+    "Tesla": "tsla.us",
     "SPY": "spy.us",
     "QQQ": "qqq.us"
 }
 
-# ─────────────────────────────
-# BOTONES
-# ─────────────────────────────
+# ================= DATA =================
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {
+            "saldo": 0,
+            "portfolio": {
+                "NVIDIA": {"units": 0.62, "avg_price": 178.41},
+                "Tesla": {"units": 0.13, "avg_price": 382.06},
+                "SPY": {"units": 0.14, "avg_price": 657.52},
+                "QQQ": {"units": 0.05, "avg_price": 603.10}
+            }
+        }
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
+
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+data = load_data()
+
+# ================= MARKET =================
+def get_price(symbol):
+    try:
+        url = f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
+        r = requests.get(url).text.split("\n")[1]
+        return float(r.split(",")[6])
+    except:
+        return None
+
+# ================= ANALYSIS =================
+def analyze(asset, price, avg_price):
+    if not price:
+        return "SIN DATOS", "ESPERAR"
+
+    change = ((price - avg_price) / avg_price) * 100
+
+    if change <= -12:
+        return "BAJADA FUERTE", "VENDER TODO"
+    elif change >= 35:
+        return "SUBIDA FUERTE", "VENDER 25%"
+    elif change >= 20:
+        return "SUBIDA", "VENDER 50%"
+    elif change < -3:
+        return "CORRECCIÓN", "POSIBLE COMPRA"
+    else:
+        return "LATERAL", "ESPERAR"
+
+# ================= UI =================
 def menu():
-    return ReplyKeyboardMarkup(
-        [
-            ["📊 Cartera", "🧠 Analizar"],
-            ["💰 Saldo", "➕ Compré"],
-            ["📈 Mercado", "📜 Historial"]
-        ],
-        resize_keyboard=True
-    )
+    m = ReplyKeyboardMarkup(resize_keyboard=True)
+    m.add("📊 Portafolio", "📈 Mercado")
+    m.add("🧠 Recomendación", "💰 Actualizar saldo")
+    return m
 
-# ─────────────────────────────
-# START
-# ─────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Bot PRO activo",
-        reply_markup=menu()
-    )
+# ================= BOTONES =================
+@bot.message_handler(commands=['start'])
+def start(msg):
+    bot.send_message(msg.chat.id, "🚀 Bot activo", reply_markup=menu())
 
-# ─────────────────────────────
-# CARTERA
-# ─────────────────────────────
-async def cartera(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    msg = "📊 PORTAFOLIO\n\n"
-
+@bot.message_handler(func=lambda m: m.text == "📊 Portafolio")
+def portfolio(msg):
+    text = "📊 TU PORTAFOLIO\n\n"
     total = 0
 
-    for k, v in data["positions"].items():
-        price = get_price(MAP[k]) or v["buy"]
-        value = price * v["shares"]
-        pct = ((price - v["buy"]) / v["buy"]) * 100
+    for asset in data["portfolio"]:
+        p = data["portfolio"][asset]
+        price = get_price(SYMBOLS[asset])
+        value = p["units"] * price if price else 0
         total += value
 
-        msg += f"{k} → {v['shares']} acc | {pct:+.2f}%\n"
+        text += f"{asset}\n"
+        text += f"Unidades: {p['units']}\n"
+        text += f"Promedio: ${p['avg_price']}\n"
+        text += f"Hoy: ${price}\n"
+        text += f"Valor: ${round(value,2)}\n\n"
 
-    msg += f"\n💰 Saldo: ${data['saldo']:.2f}"
-    msg += f"\n💼 Total: ${total + data['saldo']:.2f}"
+    text += f"💰 Total: ${round(total,2)}\n"
+    text += f"💵 Saldo: ${data['saldo']}"
 
-    await update.message.reply_text(msg)
+    bot.send_message(msg.chat.id, text)
 
-# ─────────────────────────────
-# MERCADO
-# ─────────────────────────────
-async def mercado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "📈 MERCADO\n\n"
-    for k, s in MAP.items():
-        p = get_price(s)
-        if p:
-            msg += f"{k}: ${p:.2f}\n"
-    await update.message.reply_text(msg)
+@bot.message_handler(func=lambda m: m.text == "📈 Mercado")
+def market(msg):
+    text = "📈 MERCADO\n\n"
+    for name, sym in SYMBOLS.items():
+        price = get_price(sym)
+        text += f"{name}: ${price}\n"
+    bot.send_message(msg.chat.id, text)
 
-# ─────────────────────────────
-# ANALISIS SIMPLE
-# ─────────────────────────────
-async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    msg = "🧠 ANÁLISIS\n\n"
+@bot.message_handler(func=lambda m: m.text == "💰 Actualizar saldo")
+def ask_saldo(msg):
+    bot.send_message(msg.chat.id, "Escribe tu saldo así:\nsaldo 40")
 
-    for k, v in data["positions"].items():
-        price = get_price(MAP[k])
-        if not price:
-            continue
-
-        diff = ((price - v["buy"]) / v["buy"]) * 100
-
-        if diff > 10:
-            estado = "CARO ❌"
-        elif diff < -5:
-            estado = "BARATO ✅"
-        else:
-            estado = "NORMAL ⚖️"
-
-        msg += f"{k} → {estado}\n"
-
-    await update.message.reply_text(msg)
-
-# ─────────────────────────────
-# SALDO
-# ─────────────────────────────
-async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    await update.message.reply_text(f"💰 Saldo actual: ${data['saldo']:.2f}")
-
-# ─────────────────────────────
-# REGISTRAR COMPRA
-# ─────────────────────────────
-async def comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Escribe:\nSIMBOLO MONTO\nEj: NVDA 10")
-
-# ─────────────────────────────
-# PROCESAR TEXTO
-# ─────────────────────────────
-async def texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-
-    data = load_data()
-
+@bot.message_handler(func=lambda m: m.text.startswith("saldo"))
+def set_saldo(msg):
     try:
-        sym, monto = txt.split()
-        monto = float(monto)
-        sym = sym.upper()
-
-        if sym in MAP:
-            price = get_price(MAP[sym])
-            shares = monto / price
-
-            data["saldo"] -= monto
-
-            if sym in data["positions"]:
-                data["positions"][sym]["shares"] += shares
-            else:
-                data["positions"][sym] = {"buy": price, "shares": shares}
-
-            data["historial"].append({
-                "tipo": "compra",
-                "sym": sym,
-                "monto": monto,
-                "fecha": str(datetime.now())
-            })
-
-            save_data(data)
-
-            await update.message.reply_text(
-                f"✅ Compra registrada\n\n{sym}\n${monto}\n{shares:.4f} acciones"
-            )
+        amount = float(msg.text.split()[1])
+        data["saldo"] = amount
+        save_data(data)
+        bot.send_message(msg.chat.id, f"✅ Saldo actualizado: ${amount}")
     except:
-        pass
+        bot.send_message(msg.chat.id, "Formato incorrecto")
 
-# ─────────────────────────────
-# HISTORIAL
-# ─────────────────────────────
-async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
+@bot.message_handler(func=lambda m: m.text == "🧠 Recomendación")
+def recomendacion(msg):
+    saldo = data["saldo"]
+    text = "🧠 ANÁLISIS\n\n"
 
-    msg = "📜 HISTORIAL\n\n"
+    for asset in data["portfolio"]:
+        p = data["portfolio"][asset]
+        price = get_price(SYMBOLS[asset])
+        trend, action = analyze(asset, price, p["avg_price"])
 
-    for h in data["historial"][-5:]:
-        msg += f"{h['tipo']} {h['sym']} ${h['monto']}\n"
+        text += f"{asset}\n"
+        text += f"Precio: ${price}\n"
+        text += f"Tendencia: {trend}\n"
 
-    await update.message.reply_text(msg)
+        if action == "POSIBLE COMPRA" and saldo > 10:
+            invertir = round(saldo * 0.3, 2)
+            acciones = invertir / price
 
-# ─────────────────────────────
-# MAIN
-# ─────────────────────────────
-app = ApplicationBuilder().token(TOKEN).build()
+            text += "📢 OPORTUNIDAD\n"
+            text += f"Invertir: ${invertir}\n"
+            text += f"Comprar: {acciones:.4f}\n"
+            text += f"Saldo restante: ${round(saldo - invertir,2)}\n\n"
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.Regex("📊 Cartera"), cartera))
-app.add_handler(MessageHandler(filters.Regex("🧠 Analizar"), analizar))
-app.add_handler(MessageHandler(filters.Regex("💰 Saldo"), saldo))
-app.add_handler(MessageHandler(filters.Regex("➕ Compré"), comprar))
-app.add_handler(MessageHandler(filters.Regex("📈 Mercado"), mercado))
-app.add_handler(MessageHandler(filters.Regex("📜 Historial"), historial))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, texto))
+        elif "VENDER" in action:
+            text += f"⚠️ {action}\n\n"
+        else:
+            text += "Esperar\n\n"
 
-print("Bot corriendo...")
-app.run_polling()
+    bot.send_message(msg.chat.id, text)
+
+# ================= ALERTAS =================
+def alert_loop():
+    while True:
+        try:
+            text = "📊 MONITOREO\n\n"
+            for name, sym in SYMBOLS.items():
+                price = get_price(sym)
+                text += f"{name}: ${price}\n"
+
+            bot.send_message(CHAT_ID, text)
+            time.sleep(3600)
+        except:
+            time.sleep(60)
+
+# ================= START =================
+if __name__ == "__main__":
+    print("Bot corriendo...")
+    bot.infinity_polling()
