@@ -1,165 +1,165 @@
 import os
 import csv
 import json
+import time
 import requests
-import datetime
 import telebot
 from dotenv import load_dotenv
-from threading import Thread, Event
-import time
+from threading import Thread
+from datetime import datetime, timezone
 
-# Carga variables de .env
+# ───────── CONFIG ─────────
 load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # Tu ID de Telegram para recibir alertas
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-# Archivo de datos del portafolio
+bot = telebot.TeleBot(TOKEN)
+
 DATA_FILE = "data.json"
 
-# Reglas de trading
-SELL_FULL_LOSS = -0.12    # -12%
-SELL_HALF_GAIN = 0.20     # +20%
-SELL_QUARTER_GAIN = 0.35  # +35%
-MAX_ALLOCATION = 0.5      # No más de 50% en una acción
+STOOQ_URL = "https://stooq.com/q/l/?s={}&f=sd2t2ohlcv&h&e=csv"
 
-# Symbols y link Stooq
 SYMBOLS = {
-    "NVIDIA": "NVDA.US",
-    "TESLA": "TSLA.US",
-    "SPY": "SPY.US",
-    "QQQ": "QQQ.US"
+    "NVDA": "nvda.us",
+    "TSLA": "tsla.us",
+    "SPY": "spy.us",
+    "QQQ": "qqq.us"
 }
-STOQ_LINK = "https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
 
-# Control de hilos
-stop_event = Event()
+# reglas
+STOP_LOSS = -0.12
+TP1 = 0.20
+TP2 = 0.35
 
-# Inicializa portafolio si no existe
-if not os.path.exists(DATA_FILE):
-    portfolio = {
-        "balance_total": 280.98,
-        "saldo_disponible": 1.16,
-        "acciones": {
-            "NVIDIA": {"unidades": 0.61, "precio_promedio": 178.41},
-            "TESLA": {"unidades": 0.13, "precio_promedio": 382.06},
-            "SPY": {"unidades": 0.13, "precio_promedio": 657.52},
-            "QQQ": {"unidades": 0.05, "precio_promedio": 603.10}
+# ───────── DATA ─────────
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE) as f:
+            return json.load(f)
+    return {
+        "saldo": 1.16,
+        "positions": {
+            "NVDA": {"buy": 178.41, "shares": 0.61},
+            "TSLA": {"buy": 382.06, "shares": 0.13},
+            "SPY": {"buy": 657.52, "shares": 0.13},
+            "QQQ": {"buy": 603.10, "shares": 0.05},
         }
     }
-    with open(DATA_FILE, "w") as f:
-        json.dump(portfolio, f)
-else:
-    with open(DATA_FILE, "r") as f:
-        portfolio = json.load(f)
 
-# Función para obtener precio actual desde Stooq
-def get_current_price(symbol):
-    url = STOQ_LINK.format(symbol=symbol)
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+data = load_data()
+
+# ───────── PRECIO ─────────
+def get_price(symbol):
     try:
-        response = requests.get(url)
-        decoded = response.content.decode('utf-8').splitlines()
-        reader = csv.DictReader(decoded)
-        for row in reader:
-            price = float(row['Close'])
-            return price
-    except Exception as e:
-        print(f"Error al obtener precio de {symbol}: {e}")
+        url = STOOQ_URL.format(symbol)
+        r = requests.get(url, timeout=10)
+        lines = r.text.splitlines()
+        return float(lines[1].split(",")[6])
+    except:
         return None
 
-# Función para calcular alertas de compra/venta
-def check_trading_opportunities():
-    alerts = []
-    for name, symbol in SYMBOLS.items():
-        data = portfolio["acciones"].get(name, {"unidades":0, "precio_promedio":0})
-        precio_actual = get_current_price(symbol)
-        if not precio_actual:
+# ───────── LÓGICA ─────────
+def analizar():
+    mensajes = []
+
+    for sym, stooq in SYMBOLS.items():
+        price = get_price(stooq)
+        if not price:
             continue
-        unidades = data["unidades"]
-        precio_prom = data["precio_promedio"]
-        ganancia = (precio_actual - precio_prom) / precio_prom if precio_prom > 0 else 0
 
-        # Venta por pérdida total
-        if ganancia <= SELL_FULL_LOSS and unidades > 0:
-            alerts.append(f"⚠️ {name}: cayó -12% → vender 100% ({unidades:.4f} acciones)")
-            portfolio["saldo_disponible"] += unidades * precio_actual
-            data["unidades"] = 0
+        pos = data["positions"].get(sym)
+        if not pos:
+            continue
 
-        # Venta por ganancia +20%
-        elif ganancia >= SELL_HALF_GAIN and unidades > 0:
-            to_sell = unidades * 0.5
-            alerts.append(f"💰 {name}: +20% → vender 50% ({to_sell:.4f} acciones)")
-            portfolio["saldo_disponible"] += to_sell * precio_actual
-            data["unidades"] -= to_sell
+        buy = pos["buy"]
+        shares = pos["shares"]
 
-        # Venta adicional por +35%
-        elif ganancia >= SELL_QUARTER_GAIN and unidades > 0:
-            to_sell = unidades * 0.25
-            alerts.append(f"💵 {name}: +35% → vender 25% adicional ({to_sell:.4f} acciones)")
-            portfolio["saldo_disponible"] += to_sell * precio_actual
-            data["unidades"] -= to_sell
+        pct = (price - buy) / buy
 
-        # Oportunidad de compra si saldo disponible >0
-        if portfolio["saldo_disponible"] > 0:
-            max_compra = portfolio["balance_total"] * MAX_ALLOCATION
-            cantidad_compra = min(portfolio["saldo_disponible"], max_compra)
-            unidades_compra = cantidad_compra / precio_actual
-            if unidades_compra > 0:
-                alerts.append(f"💡 Puedes comprar {name}: ${cantidad_compra:.2f} → {unidades_compra:.4f} acciones")
-    
-    # Guardar portafolio actualizado
-    with open(DATA_FILE, "w") as f:
-        json.dump(portfolio, f)
-    
-    return alerts
+        # STOP LOSS
+        if pct <= STOP_LOSS:
+            mensajes.append(
+                f"🔴 {sym}\nVENDER TODO\n"
+                f"{shares:.4f} acciones\n"
+                f"${shares*price:.2f}"
+            )
 
-# Función para enviar informe diario
-def send_daily_report():
-    msg = f"📊 Informe de portafolio {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-    msg += f"Balance total: ${portfolio['balance_total']:.2f}\n"
-    msg += f"Saldo disponible: ${portfolio['saldo_disponible']:.2f}\n\n"
-    for name, data in portfolio["acciones"].items():
-        precio_actual = get_current_price(SYMBOLS[name])
-        unidades = data["unidades"]
-        precio_prom = data["precio_promedio"]
-        ganancia = (precio_actual - precio_prom) / precio_prom if precio_prom > 0 else 0
-        msg += f"- {name}: {unidades:.4f} acciones | Precio actual: ${precio_actual:.2f} | Ganancia: {ganancia*100:.2f}%\n"
-    bot.send_message(CHAT_ID, msg)
+        # TAKE PROFIT 1
+        elif pct >= TP1:
+            vender = shares * 0.5
+            mensajes.append(
+                f"🟢 {sym}\nVENDER 50%\n"
+                f"{vender:.4f} acciones\n"
+                f"${vender*price:.2f}"
+            )
 
-# Hilo para alertas periódicas
-def trading_loop():
-    while not stop_event.is_set():
-        alerts = check_trading_opportunities()
-        for alert in alerts:
-            bot.send_message(CHAT_ID, alert)
-        time.sleep(60*5)  # Cada 5 minutos
+        # TAKE PROFIT 2
+        elif pct >= TP2:
+            vender = shares * 0.25
+            mensajes.append(
+                f"🟢 {sym}\nVENDER 25%\n"
+                f"{vender:.4f} acciones\n"
+                f"${vender*price:.2f}"
+            )
 
-# Comandos de Telegram
+    # COMPRA
+    saldo = data["saldo"]
+
+    if saldo > 5:
+        for sym, stooq in SYMBOLS.items():
+            price = get_price(stooq)
+            if not price:
+                continue
+
+            monto = saldo * 0.25
+            acciones = monto / price
+
+            mensajes.append(
+                f"💡 COMPRA {sym}\n"
+                f"Usa: ${monto:.2f}\n"
+                f"{acciones:.4f} acciones"
+            )
+
+    return mensajes
+
+# ───────── LOOP ─────────
+def loop():
+    while True:
+        try:
+            mensajes = analizar()
+            for m in mensajes:
+                bot.send_message(CHAT_ID, m)
+            time.sleep(300)
+        except Exception as e:
+            print("Error:", e)
+            time.sleep(60)
+
+# ───────── COMANDOS ─────────
 @bot.message_handler(commands=["start"])
-def cmd_start(message):
-    bot.send_message(message.chat.id, "🤖 Bot activo. Recibirás alertas de trading y reportes diarios.")
+def start(msg):
+    bot.send_message(msg.chat.id, "✅ Bot activo y monitoreando mercado")
 
-@bot.message_handler(commands=["balance"])
-def cmd_balance(message):
-    send_daily_report()
+@bot.message_handler(commands=["saldo"])
+def saldo(msg):
+    bot.send_message(msg.chat.id, f"💰 Saldo: ${data['saldo']:.2f}")
 
-@bot.message_handler(commands=["aporte"])
-def cmd_aporte(message):
-    msg = bot.send_message(message.chat.id, "Ingresa el monto que depositaste esta semana:")
-    bot.register_next_step_handler(msg, process_aporte)
-
-def process_aporte(message):
+@bot.message_handler(commands=["setsaldo"])
+def setsaldo(msg):
     try:
-        aporte = float(message.text)
-        portfolio["saldo_disponible"] += aporte
-        with open(DATA_FILE, "w") as f:
-            json.dump(portfolio, f)
-        bot.send_message(message.chat.id, f"Aporte recibido: ${aporte:.2f}. Saldo disponible actualizado: ${portfolio['saldo_disponible']:.2f}")
+        monto = float(msg.text.split()[1])
+        data["saldo"] = monto
+        save_data(data)
+        bot.send_message(msg.chat.id, f"Saldo actualizado: ${monto}")
     except:
-        bot.send_message(message.chat.id, "Error: ingresa un número válido.")
+        bot.send_message(msg.chat.id, "Uso: /setsaldo 50")
 
-# Inicia el bot y el hilo de trading
+# ───────── INICIO ─────────
 if __name__ == "__main__":
-    Thread(target=trading_loop, daemon=True).start()
+    bot.send_message(CHAT_ID, "🚀 Bot iniciado en Railway")
+    Thread(target=loop, daemon=True).start()
     bot.infinity_polling()
