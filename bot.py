@@ -5,12 +5,11 @@ import time
 import requests
 import telebot
 from dotenv import load_dotenv
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 from threading import Thread
-from datetime import datetime, timezone
 
 # ───────── CONFIG ─────────
 load_dotenv()
-
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
@@ -27,7 +26,6 @@ SYMBOLS = {
     "QQQ": "qqq.us"
 }
 
-# reglas
 STOP_LOSS = -0.12
 TP1 = 0.20
 TP2 = 0.35
@@ -38,34 +36,112 @@ def load_data():
         with open(DATA_FILE) as f:
             return json.load(f)
     return {
-        "saldo": 1.16,
-        "positions": {
-            "NVDA": {"buy": 178.41, "shares": 0.61},
-            "TSLA": {"buy": 382.06, "shares": 0.13},
-            "SPY": {"buy": 657.52, "shares": 0.13},
-            "QQQ": {"buy": 603.10, "shares": 0.05},
-        }
+        "saldo": 0,
+        "positions": {}
     }
 
-def save_data(data):
+def save_data(d):
     with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(d, f, indent=2)
 
 data = load_data()
+
+# ───────── TECLADO ─────────
+def menu():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("📊 Cartera", "🧠 Analizar")
+    kb.row("💰 Saldo", "➕ Compré")
+    return kb
 
 # ───────── PRECIO ─────────
 def get_price(symbol):
     try:
-        url = STOOQ_URL.format(symbol)
-        r = requests.get(url, timeout=10)
+        r = requests.get(STOOQ_URL.format(symbol), timeout=10)
         lines = r.text.splitlines()
         return float(lines[1].split(",")[6])
     except:
         return None
 
-# ───────── LÓGICA ─────────
-def analizar():
-    mensajes = []
+# ───────── COMANDOS ─────────
+@bot.message_handler(commands=["start"])
+def start(msg):
+    bot.send_message(msg.chat.id, "🤖 Bot PRO activo", reply_markup=menu())
+
+# ───────── BOTONES ─────────
+@bot.message_handler(func=lambda m: True)
+def handle(msg):
+    text = msg.text
+
+    # ── CARTERA ──
+    if text == "📊 Cartera":
+        out = "📊 TU PORTAFOLIO\n\n"
+        for sym, pos in data["positions"].items():
+            price = get_price(SYMBOLS[sym])
+            if not price:
+                continue
+            pct = (price - pos["buy"]) / pos["buy"] * 100
+            out += f"{sym}: {pos['shares']} acc | {pct:+.1f}%\n"
+        out += f"\n💰 Saldo: ${data['saldo']:.2f}"
+        bot.send_message(msg.chat.id, out)
+
+    # ── SALDO ──
+    elif text == "💰 Saldo":
+        msg2 = bot.send_message(msg.chat.id, "Ingresa saldo:")
+        bot.register_next_step_handler(msg2, set_saldo)
+
+    # ── ANALIZAR ──
+    elif text == "🧠 Analizar":
+        analizar(msg.chat.id)
+
+    # ── COMPRÉ ──
+    elif text == "➕ Compré":
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        for s in SYMBOLS:
+            kb.add(s)
+        msg2 = bot.send_message(msg.chat.id, "¿Qué compraste?", reply_markup=kb)
+        bot.register_next_step_handler(msg2, comprar)
+
+# ───────── FUNCIONES ─────────
+def set_saldo(msg):
+    try:
+        monto = float(msg.text)
+        data["saldo"] = monto
+        save_data(data)
+        bot.send_message(msg.chat.id, f"Saldo actualizado: ${monto}", reply_markup=menu())
+    except:
+        bot.send_message(msg.chat.id, "Error", reply_markup=menu())
+
+def comprar(msg):
+    sym = msg.text.upper()
+    if sym not in SYMBOLS:
+        bot.send_message(msg.chat.id, "Error", reply_markup=menu())
+        return
+
+    price = get_price(SYMBOLS[sym])
+    if not price:
+        bot.send_message(msg.chat.id, "Error precio", reply_markup=menu())
+        return
+
+    monto = data["saldo"] * 0.25
+    shares = monto / price
+
+    data["saldo"] -= monto
+
+    data["positions"][sym] = {
+        "buy": price,
+        "shares": round(shares, 4)
+    }
+
+    save_data(data)
+
+    bot.send_message(
+        msg.chat.id,
+        f"✅ Compra registrada\n{sym}\n${monto:.2f}\n{shares:.4f} acciones",
+        reply_markup=menu()
+    )
+
+def analizar(chat_id):
+    saldo = data["saldo"]
 
     for sym, stooq in SYMBOLS.items():
         price = get_price(stooq)
@@ -73,93 +149,41 @@ def analizar():
             continue
 
         pos = data["positions"].get(sym)
-        if not pos:
-            continue
 
-        buy = pos["buy"]
-        shares = pos["shares"]
+        # SI TIENES POSICIÓN → VENDER
+        if pos:
+            pct = (price - pos["buy"]) / pos["buy"]
 
-        pct = (price - buy) / buy
+            if pct <= STOP_LOSS:
+                bot.send_message(chat_id, f"🔴 {sym} VENDER TODO")
 
-        # STOP LOSS
-        if pct <= STOP_LOSS:
-            mensajes.append(
-                f"🔴 {sym}\nVENDER TODO\n"
-                f"{shares:.4f} acciones\n"
-                f"${shares*price:.2f}"
-            )
+            elif pct >= TP1:
+                bot.send_message(chat_id, f"🟢 {sym} VENDER 50%")
 
-        # TAKE PROFIT 1
-        elif pct >= TP1:
-            vender = shares * 0.5
-            mensajes.append(
-                f"🟢 {sym}\nVENDER 50%\n"
-                f"{vender:.4f} acciones\n"
-                f"${vender*price:.2f}"
-            )
+            elif pct >= TP2:
+                bot.send_message(chat_id, f"🟢 {sym} VENDER 25%")
 
-        # TAKE PROFIT 2
-        elif pct >= TP2:
-            vender = shares * 0.25
-            mensajes.append(
-                f"🟢 {sym}\nVENDER 25%\n"
-                f"{vender:.4f} acciones\n"
-                f"${vender*price:.2f}"
-            )
+        # SI NO TIENES → COMPRA
+        else:
+            if saldo > 5:
+                monto = saldo * 0.25
+                acciones = monto / price
 
-    # COMPRA
-    saldo = data["saldo"]
-
-    if saldo > 5:
-        for sym, stooq in SYMBOLS.items():
-            price = get_price(stooq)
-            if not price:
-                continue
-
-            monto = saldo * 0.25
-            acciones = monto / price
-
-            mensajes.append(
-                f"💡 COMPRA {sym}\n"
-                f"Usa: ${monto:.2f}\n"
-                f"{acciones:.4f} acciones"
-            )
-
-    return mensajes
+                bot.send_message(
+                    chat_id,
+                    f"💡 {sym}\nCompra ${monto:.2f}\n{acciones:.4f} acciones"
+                )
 
 # ───────── LOOP ─────────
 def loop():
     while True:
         try:
-            mensajes = analizar()
-            for m in mensajes:
-                bot.send_message(CHAT_ID, m)
+            analizar(CHAT_ID)
             time.sleep(300)
-        except Exception as e:
-            print("Error:", e)
+        except:
             time.sleep(60)
 
-# ───────── COMANDOS ─────────
-@bot.message_handler(commands=["start"])
-def start(msg):
-    bot.send_message(msg.chat.id, "✅ Bot activo y monitoreando mercado")
-
-@bot.message_handler(commands=["saldo"])
-def saldo(msg):
-    bot.send_message(msg.chat.id, f"💰 Saldo: ${data['saldo']:.2f}")
-
-@bot.message_handler(commands=["setsaldo"])
-def setsaldo(msg):
-    try:
-        monto = float(msg.text.split()[1])
-        data["saldo"] = monto
-        save_data(data)
-        bot.send_message(msg.chat.id, f"Saldo actualizado: ${monto}")
-    except:
-        bot.send_message(msg.chat.id, "Uso: /setsaldo 50")
-
-# ───────── INICIO ─────────
+# ───────── START ─────────
 if __name__ == "__main__":
-    bot.send_message(CHAT_ID, "🚀 Bot iniciado en Railway")
     Thread(target=loop, daemon=True).start()
     bot.infinity_polling()
