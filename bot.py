@@ -1,210 +1,156 @@
-import os.
+import os
 import time
 import json
 import requests
+import yfinance as yf
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- CONFIGURACIÓN CRÍTICA ---
 TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-URL = f"https://api.telegram.org/bot{TOKEN}"
-
+CHAT_ID = "8654226316"  # Tu ID verificado
+URL = f"https://api.telegram.org{TOKEN}"
 DATA_FILE = "data.json"
 
-# ───── TUS DATOS INICIALES ─────
+# Datos iniciales extraídos de tus reportes de Tyba
 DEFAULT_DATA = {
-    "saldo": 0,
-    "usar_saldo": False,
+    "saldo_efectivo": 1.16,
     "positions": {
-        "NVDA": {"buy": 178.41, "shares": 0.61},
-        "SPY":  {"buy": 657.52, "shares": 0.13},
-        "TSLA": {"buy": 382.06, "shares": 0.13},
-        "QQQ":  {"buy": 603.10, "shares": 0.05},
+        "NVDA": {"buy": 178.41, "shares": 0.61656428, "comm": 0.33},
+        "TSLA": {"buy": 382.06, "shares": 0.13086881, "comm": 0.15},
+        "SPY":  {"buy": 657.52, "shares": 0.13687838, "comm": 0.27},
+        "QQQ":  {"buy": 603.10, "shares": 0.05, "comm": 0.15} # Estimado
     }
 }
 
-BUY_LEVELS = {
-    "NVDA":170,
-    "TSLA":360,
-    "SPY":600,
-    "QQQ":580
-}
+# Niveles para avisarte de compra (Precios accesibles)
+BUY_LEVELS = {"NVDA": 170, "TSLA": 360, "SPY": 640, "QQQ": 580}
 
-# ───── DATA ─────
 def load_data():
-    try:
-        with open(DATA_FILE,"r") as f:
-            return json.load(f)
-    except:
-        return DEFAULT_DATA
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f: return json.load(f)
+    return DEFAULT_DATA
 
 def save_data(d):
-    with open(DATA_FILE,"w") as f:
-        json.dump(d,f,indent=2)
+    with open(DATA_FILE, "w") as f: json.dump(d, f, indent=4)
 
 data = load_data()
 
-# ───── TELEGRAM ─────
-def send(msg, keyboard=None):
-    payload = {"chat_id": CHAT_ID, "text": msg}
-    if keyboard:
-        payload["reply_markup"] = json.dumps(keyboard)
-    requests.post(f"{URL}/sendMessage", data=payload)
+def send_msg(text):
+    requests.post(f"{URL}/sendMessage", data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
-def menu():
-    keyboard = {
-        "keyboard":[
-            ["📊 Estado","💰 Saldo"],
-            ["💵 Cargar saldo","📌 Acción"],
-        ],
-        "resize_keyboard":True
-    }
-    send("📲 MENÚ", keyboard)
-
-# ───── PRECIO ─────
-def price(sym):
+def get_live_price(ticker):
     try:
-        r = requests.get(f"https://stooq.com/q/l/?s={sym.lower()}.us&f=sd2t2ohlcv&h&e=csv")
-        return float(r.text.split("\n")[1].split(",")[6])
-    except:
-        return None
+        asset = yf.Ticker(ticker)
+        return asset.fast_info['last_price']
+    except: return None
 
-# ───── HORARIO ─────
-def mercado_abierto():
-    now = datetime.now(timezone.utc)
-    if now.weekday() >= 5:
-        return False
-    h = now.hour + now.minute/60
-    return 13.5 <= h <= 20
+# --- FUNCIONES DE ÉLITE ---
 
-# ───── ANALISIS ─────
-def analizar():
+def registrar_operacion(ticker, monto_usd, precio_ejecucion):
+    """Calcula costo promedio y resta comisión estimada de $0.15"""
+    ticker = ticker.upper()
+    comm = 0.15 
+    shares_compradas = (monto_usd - comm) / precio_ejecucion
+    
+    pos = data["positions"].get(ticker, {"buy": 0, "shares": 0, "comm": 0})
+    
+    # Nuevo Costo Promedio Ponderado
+    total_shares = pos["shares"] + shares_compradas
+    nuevo_costo = ((pos["buy"] * pos["shares"]) + (precio_ejecucion * shares_compradas)) / total_shares
+    
+    data["positions"][ticker] = {
+        "buy": round(nuevo_costo, 4),
+        "shares": round(total_shares, 8),
+        "comm": pos["comm"] + comm
+    }
+    save_data(data)
+    return f"✅ Compra exitosa: {shares_compradas:.6f} un. de {ticker}"
 
-    acciones = []
-    saldo = data["saldo"]
-    usar = data["usar_saldo"]
+def analizar_mercado():
+    alertas = []
+    total_valor_acciones = 0
+    
+    for ticker, info in data["positions"].items():
+        p = get_live_price(ticker)
+        if not p: continue
+        
+        # Cálculos de rentabilidad
+        valor_actual = p * info["shares"]
+        total_valor_acciones += valor_actual
+        ganancia_pct = ((p - info["buy"]) / info["buy"]) * 100
+        
+        # 1. Alerta de Venta (Toma de ganancias escalonada)
+        if ganancia_pct >= 20:
+            alertas.append(f"💰 *{ticker} +{ganancia_pct:.2f}%*\n¡Momento de vender el 50% para asegurar profit!")
+        
+        # 2. Alerta de Compra (Precio accesible)
+        if p <= BUY_LEVELS.get(ticker, 0):
+            alertas.append(f"💎 *{ticker} en OFERTA*\nPrecio actual: ${p:.2f}\n(Tu meta: ${BUY_LEVELS[ticker]})")
 
-    for name, pos in data["positions"].items():
-        p = price(name)
-        if not p:
-            continue
+    if alertas:
+        send_msg("🔔 *ALERTAS DE TRADING*\n\n" + "\n\n".join(alertas))
 
-        buy = pos["buy"]
-        sh = pos["shares"]
-        pct = ((p - buy)/buy)*100
-        actual = sh * p
-
-        # VENTAS
-        if pct <= -12:
-            acciones.append(
-                f"🔴 {name}\nVENDER TODO\n{sh} → ${actual:.2f}"
-            )
-
-        elif pct >= 35:
-            v = round(sh*0.25,4)
-            m = round(actual*0.25,2)
-            acciones.append(
-                f"🟢 {name}\nVENDER 25%\n{v} → ${m}"
-            )
-
-        elif pct >= 20:
-            v = round(sh*0.5,4)
-            m = round(actual*0.5,2)
-            acciones.append(
-                f"🟢 {name}\nVENDER 50%\n{v} → ${m}"
-            )
-
-    # COMPRAS (SIEMPRE)
-    for name in data["positions"].keys():
-        p = price(name)
-        if p and p < BUY_LEVELS[name]:
-
-            monto = 50  # fijo disciplinado
-            acciones_calc = round(monto/p,4)
-
-            if usar and saldo >= monto:
-                data["saldo"] -= monto
-                save_data(data)
-                acciones.append(
-                    f"🟢 {name}\nCOMPRAR ${monto}\n{acciones_calc} acciones\nSaldo restante: ${data['saldo']}"
-                )
-            else:
-                acciones.append(
-                    f"🟢 {name}\nOPORTUNIDAD\nComprar ${monto} → {acciones_calc} acciones\n(Sin saldo)"
-                )
-
-    if acciones:
-        send("📊 ACCIONES HOY\n\n" + "\n\n".join(acciones))
-    else:
-        send("📌 HOY: NO HACER NADA")
-
-# ───── RESUMEN ─────
-def resumen():
-    msg = "📊 RESUMEN DEL DÍA\n\n"
-    for name, pos in data["positions"].items():
-        p = price(name)
+def resumen_cartera():
+    msg = "📊 *RESUMEN DE TU CUENTA TYBA*\n"
+    msg += "───────────────────\n"
+    total_invertido = 0
+    total_actual = 0
+    
+    for t, i in data["positions"].items():
+        p = get_live_price(t)
         if p:
-            pct = ((p-pos["buy"])/pos["buy"])*100
-            msg += f"{name}: {pct:+.2f}%\n"
-    send(msg)
+            v_actual = p * i["shares"]
+            v_inv = i["buy"] * i["shares"]
+            gain = v_actual - v_inv
+            total_actual += v_actual
+            total_invertido += v_inv
+            icon = "📈" if gain >= 0 else "📉"
+            msg += f"{icon} *{t}*: ${v_actual:.2f} ({ (gain/v_inv)*100 :+.2f}%)\n"
+    
+    msg += "───────────────────\n"
+    msg += f"💵 Acciones: ${total_actual:.2f}\n"
+    msg += f"💰 Saldo Cash: ${data['saldo_efectivo']:.2f}\n"
+    msg += f"🔥 *Balance Total: ${total_actual + data['saldo_efectivo']:.2f}*\n"
+    send_msg(msg)
 
-# ───── COMANDOS ─────
-def handle(text):
+# --- BOT HANDLER ---
 
-    if text == "/start":
-        menu()
-
-    elif text == "📊 Estado":
-        msg = "📊 PORTAFOLIO\n\n"
-        for k,v in data["positions"].items():
-            msg += f"{k}: {v['shares']} @ ${v['buy']}\n"
-        send(msg)
-
-    elif text == "💰 Saldo":
-        send(f"💰 Saldo: ${data['saldo']}")
-
-    elif text == "💵 Cargar saldo":
-        data["usar_saldo"] = True
-        save_data(data)
-        send("✅ Modo compra ACTIVADO\nAhora usa: /saldo 100")
-
-    elif text.startswith("/saldo"):
-        val = float(text.split()[1])
-        data["saldo"] = val
-        save_data(data)
-        send(f"✅ Saldo actualizado: ${val}")
-
-    elif text == "📌 Acción":
-        analizar()
-
-# ───── LISTENER ─────
-def listener():
-    last = None
+def main_loop():
+    last_update = 0
+    send_msg("🚀 *Bot de Inversiones Tyba Online*")
+    
     while True:
-        r = requests.get(f"{URL}/getUpdates", params={"timeout":30,"offset":last}).json()
-        for u in r["result"]:
-            last = u["update_id"]+1
-            text = u["message"].get("text","")
-            handle(text)
+        try:
+            # Revisar mensajes de Telegram
+            r = requests.get(f"{URL}/getUpdates", params={"offset": last_update, "timeout": 20}).json()
+            for u in r.get("result", []):
+                last_update = u["update_id"] + 1
+                msg = u.get("message", {})
+                text = msg.get("text", "")
+                
+                if str(msg.get("from", {}).get("id")) != CHAT_ID: continue
 
-# ───── LOOP ─────
-def loop():
-    send("🚀 BOT ACTIVO")
+                if text == "/estado":
+                    resumen_cartera()
+                elif text.startswith("/comprar"): # /comprar NVDA 50 125.5
+                    _, t, monto, precio = text.split()
+                    confirmacion = registrar_operacion(t, float(monto), float(precio))
+                    send_msg(confirmacion)
+                elif text == "/analizar":
+                    analizar_mercado()
 
-    while True:
-        if mercado_abierto():
-            analizar()
-            time.sleep(3600)
-        else:
-            now = datetime.now(timezone.utc)
-            if now.hour == 20:
-                resumen()
-            time.sleep(1800)
+            # Análisis automático cada 4 horas
+            now = datetime.now()
+            if now.hour % 4 == 0 and now.minute == 0:
+                analizar_mercado()
+                time.sleep(60)
 
-# ───── START ─────
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(10)
+
 if __name__ == "__main__":
-    import threading
-    threading.Thread(target=listener).start()
-    loop()
+    main_loop()
