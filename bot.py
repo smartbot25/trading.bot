@@ -1,133 +1,136 @@
 import os
-import time
 import json
 import requests
-from datetime import datetime, timezone
+import logging
+from datetime import datetime
 from dotenv import load_dotenv
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
+
+# Configuración de logs
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 load_dotenv()
 
-# --- CONFIGURACIÓN CRÍTICA ---
+# --- VARIABLES DE ENTORNO ---
 TOKEN = os.getenv("TOKEN")
-CHAT_ID = "8654226316"  # Tu ID verificado
-URL = f"https://api.telegram.org{TOKEN}"
+CHAT_ID = os.getenv("CHAT_ID")
 DATA_FILE = "data.json"
 
-# Datos iniciales reales de tu Tyba
+# Estados para conversaciones
+ESPERANDO_DEPOSITO, ESPERANDO_COMPRA_TICKER, ESPERANDO_COMPRA_MONTO = range(3)
+
+# --- BASE DE DATOS LOCAL ---
 DEFAULT_DATA = {
     "saldo_efectivo": 1.16,
     "positions": {
-        "NVDA": {"buy": 178.41, "shares": 0.61656428, "comm": 0.33},
-        "TSLA": {"buy": 382.06, "shares": 0.13086881, "comm": 0.15},
-        "SPY":  {"buy": 657.52, "shares": 0.13687838, "comm": 0.27},
-        "QQQ":  {"buy": 603.10, "shares": 0.05, "comm": 0.15}
-    }
+        "NVDA": {"buy": 178.41, "shares": 0.61656428},
+        "TSLA": {"buy": 382.06, "shares": 0.13086881},
+        "SPY":  {"buy": 657.52, "shares": 0.13687838},
+        "QQQ":  {"buy": 603.10, "shares": 0.05}
+    },
+    "historial": []
 }
-
-BUY_LEVELS = {"NVDA": 170, "TSLA": 360, "SPY": 640, "QQQ": 580}
 
 def load_data():
     if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r") as f: return json.load(f)
-        except: return DEFAULT_DATA
+        with open(DATA_FILE, "r") as f: return json.load(f)
     return DEFAULT_DATA
 
 def save_data(d):
     with open(DATA_FILE, "w") as f: json.dump(d, f, indent=4)
 
-data = load_data()
-
-def send_msg(text):
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    requests.post(f"{URL}/sendMessage", data=payload)
-
-def get_live_price(ticker):
-    """Obtiene precio desde Stooq (Ligero para Termux)"""
+def get_price(ticker):
     try:
-        symbol = f"{ticker.lower()}.us"
-        url = f"https://stooq.com{symbol}&f=sd2t2ohlcv&h&e=csv"
-        r = requests.get(url, timeout=10)
-        lines = r.text.strip().split('\n')
-        if len(lines) > 1:
-            datos = lines[1].split(',')
-            return float(datos[6]) # El precio actual es la columna 7
-        return None
+        url = f"https://query1.finance.yahoo.com{ticker}?interval=1m&range=1d"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url, headers=headers, timeout=10).json()
+        return r['chart']['result'][0]['meta']['regularMarketPrice']
     except: return None
 
-# --- FUNCIONES DE LOGICA ---
+# --- FUNCIONES DE LÓGICA ---
 
-def registrar_compra(ticker, monto_usd, precio_ejecucion):
-    ticker = ticker.upper()
-    comm = 0.15 # Comisión estándar Tyba
-    shares_compradas = (monto_usd - comm) / precio_ejecucion
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Verificación de seguridad
+    if str(update.effective_chat.id) != str(CHAT_ID):
+        return await update.message.reply_text("❌ No autorizado.")
+
+    kb = [['📊 Cartera', '🔍 Analizar'], ['💰 Saldo/Depósito', '➕ Registrar Compra']]
+    await update.message.reply_text(
+        "🚀 *Tyba Financial Advisor Pro*\nBienvenido, analista. ¿Qué deseas gestionar hoy?",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    )
+
+async def mostrar_cartera(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    msg = "📊 *ESTADO DE TU PORTAFOLIO*\n\n"
+    total_inv = 0
     
-    pos = data["positions"].get(ticker, {"buy": 0, "shares": 0, "comm": 0})
-    total_shares = pos["shares"] + shares_compradas
-    nuevo_costo = ((pos["buy"] * pos["shares"]) + (precio_ejecucion * shares_compradas)) / total_shares
-    
-    data["positions"][ticker] = {
-        "buy": round(nuevo_costo, 4),
-        "shares": round(total_shares, 8),
-        "comm": pos["comm"] + comm
-    }
-    save_data(data)
-    return f"✅ *Compra registrada*\n{ticker}: {shares_compradas:.6f} un.\nNuevo Promedio: ${nuevo_costo:.2f}"
-
-def analizar_mercado():
-    alertas = []
-    for t, info in data["positions"].items():
-        p = get_live_price(t)
-        if not p: continue
-        ganancia_pct = ((p - info["buy"]) / info["buy"]) * 100
-        
-        if ganancia_pct >= 20:
-            alertas.append(f"🟢 *{t} +{ganancia_pct:.1f}%*\nVende 50% para asegurar.")
-        if p <= BUY_LEVELS.get(t, 0):
-            alertas.append(f"💎 *{t} EN OFERTA*\nPrecio: ${p:.2f} (Meta: ${BUY_LEVELS[t]})")
-
-    if alertas: send_msg("🔔 *ALERTAS HOY*\n\n" + "\n\n".join(alertas))
-    else: send_msg("😴 Sin movimientos urgentes.")
-
-def resumen_cartera():
-    msg = "📊 *MI CUENTA TYBA*\n"
-    total_actual = 0
     for t, i in data["positions"].items():
-        p = get_live_price(t) or i["buy"]
+        p = get_price(t) or i["buy"]
         v_actual = p * i["shares"]
-        gain = v_actual - (i["buy"] * i["shares"])
-        total_actual += v_actual
-        icon = "📈" if gain >= 0 else "📉"
-        msg += f"{icon} *{t}*: ${v_actual:.2f} ({ (gain/(i['buy']*i['shares']))*100 :+.1f}%)\n"
-    msg += f"\n🔥 *Total: ${total_actual + data['saldo_efectivo']:.2f}*"
-    send_msg(msg)
+        gain_pct = ((p - i["buy"]) / i["buy"]) * 100
+        total_inv += v_actual
+        icon = "📈" if gain_pct >= 0 else "📉"
+        msg += f"{icon} *{t}*: ${v_actual:.2f} ({gain_pct:+.2f}%)\n   _P. Promedio: ${i['buy']:.2f}_\n"
+    
+    saldo = data["saldo_efectivo"]
+    msg += f"\n💵 *Efectivo:* ${saldo:.2f}\n🔥 *TOTAL:* ${total_inv + saldo:.2f}"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-# --- BUCLE PRINCIPAL ---
-def main():
-    last_update = 0
-    send_msg("🚀 *Bot Tyba Online (Modo Ligero)*")
-    while True:
-        try:
-            r = requests.get(f"{URL}/getUpdates", params={"offset": last_update, "timeout": 20}).json()
-            for u in r.get("result", []):
-                last_update = u["update_id"] + 1
-                msg = u.get("message", {})
-                if str(msg.get("from", {}).get("id")) != CHAT_ID: continue
-                
-                text = msg.get("text", "")
-                if text == "/estado": resumen_cartera()
-                elif text == "/analizar": analizar_mercado()
-                elif text.startswith("/comprar"):
-                    # Uso: /comprar NVDA 50 120.5
-                    p = text.split()
-                    send_msg(registrar_compra(p[1], float(p[2]), float(p[3])))
-            
-            # Auto-análisis a las 15:00 UTC (Cierre de mercado aprox)
-            now = datetime.now(timezone.utc)
-            if now.hour == 15 and now.minute == 0:
-                analizar_mercado()
-                time.sleep(60)
-        except: time.sleep(10)
+# --- GESTIÓN DE DEPÓSITO ---
+async def iniciar_deposito(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("💰 *Depósito:* ¿Cuánto dinero ingresaste a Tyba?")
+    return ESPERANDO_DEPOSITO
 
-if __name__ == "__main__":
-    main()
+async def procesar_deposito(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        monto = float(update.message.text)
+        data = load_data()
+        data["saldo_efectivo"] += monto
+        data["historial"].append({"tipo": "deposito", "monto": monto, "fecha": str(datetime.now())})
+        save_data(data)
+        await update.message.reply_text(f"✅ Saldo actualizado: *${data['saldo_efectivo']:.2f}*", parse_mode="Markdown")
+    except:
+        await update.message.reply_text("❌ Error. Envía solo el número.")
+    return ConversationHandler.END
+
+# --- ANÁLISIS ---
+async def analizar_mercado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    msg = "🔍 *ANÁLISIS DE OPORTUNIDADES*\n\n"
+    found = False
+    for t, i in data["positions"].items():
+        p = get_price(t)
+        if not p: continue
+        diff = ((p - i["buy"]) / i["buy"]) * 100
+        if diff <= -5:
+            sugerencia = (data["saldo_efectivo"] * 0.10) # Sugiere usar 10% del saldo
+            msg += f"💎 *{t} en descuento:* ({diff:.1f}%)\nSugerencia: Compra *${sugerencia:.2f}* para promediar.\n\n"
+            found = True
+        elif diff >= 20:
+            msg += f"💰 *{t} en ganancias:* (+{diff:.1f}%)\nSugerencia: Vende el 25% para asegurar.\n\n"
+            found = True
+    
+    if not found: msg += "😴 El mercado está estable. No hay acciones en zona crítica."
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+# --- MAIN ---
+if __name__ == '__main__':
+    app = ApplicationBuilder().token(TOKEN).build()
+    
+    # Manejador de conversación para depósitos
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^💰 Saldo/Depósito$'), iniciar_deposito)],
+        states={ESPERANDO_DEPOSITO: [MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_deposito)]},
+        fallbacks=[]
+    )
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Regex('^📊 Cartera$'), mostrar_cartera))
+    app.add_handler(MessageHandler(filters.Regex('^🔍 Analizar$'), analizar_mercado))
+    app.add_handler(conv_handler)
+    
+    print("Bot Activo...")
+    app.run_polling()
