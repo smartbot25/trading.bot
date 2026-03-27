@@ -193,6 +193,58 @@ def alert_loop():
             time.sleep(3600) 
         except:
             time.sleep(60)
+# ================= COMANDO DE COMPRA (DCA) =================
+@bot.message_handler(func=lambda m: m.text == "🛒 Registrar Compra")
+def ask_buy(msg):
+    instrucciones = (
+        "📝 **Cómo registrar una compra:**\n\n"
+        "Escribe el comando así:\n"
+        "`comprar NVIDIA 0.1 145.50`\n\n"
+        "*(Activo, Unidades nuevas, Precio pagado)*"
+    )
+    bot.send_message(msg.chat.id, instrucciones, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: m.text.startswith("comprar"))
+def execute_buy(msg):
+    try:
+        # Ejemplo: comprar NVIDIA 0.1 145.50
+        parts = msg.text.split()
+        asset = parts[1].upper()
+        new_units = float(parts[2])
+        buy_price = float(parts[3])
+
+        data = load_data() # Carga de Redis
+
+        if asset in data["portfolio"]:
+            old_units = data["portfolio"][asset]["units"]
+            old_avg = data["portfolio"][asset]["avg_price"]
+
+            # FÓRMULA MATEMÁTICA DEL PROMEDIO (DCA)
+            total_units = old_units + new_units
+            new_avg = ((old_units * old_avg) + (new_units * buy_price)) / total_units
+
+            # Actualizar datos
+            data["portfolio"][asset]["units"] = round(total_units, 4)
+            data["portfolio"][asset]["avg_price"] = round(new_avg, 2)
+            
+            save_data(data) # Guarda en Redis
+            
+            res = f"✅ **{asset} Actualizado**\n"
+            res += f"Nuevas Unidades: {round(total_units, 4)}\n"
+            res += f"Nuevo Promedio: ${round(new_avg, 2)}"
+            bot.send_message(msg.chat.id, res, parse_mode="Markdown")
+        else:
+            bot.send_message(msg.chat.id, "❌ Ese activo no está en tu lista.")
+    except Exception as e:
+        bot.send_message(msg.chat.id, "❌ Error. Usa: `comprar ACTIVO UNIDADES PRECIO`")
+
+# No olvides agregar el botón al menú principal
+def menu():
+    m = ReplyKeyboardMarkup(resize_keyboard=True)
+    m.add("📊 Portafolio", "📈 Mercado")
+    m.add("🧠 Recomendación", "💰 Actualizar saldo")
+    m.add("🛒 Registrar Compra") # <-- Agrega esta línea
+    return m
 
 # ================= INICIO =================
 if __name__ == "__main__":
