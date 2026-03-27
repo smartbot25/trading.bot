@@ -13,9 +13,26 @@ CHAT_ID = os.getenv("CHAT_ID")
 if CHAT_ID:
     CHAT_ID = int(CHAT_ID)
 
-# Conexión a Base de Datos Redis
+# --- CONEXIÓN A REDIS (Memoria Permanente) ---
 REDIS_URL = os.getenv("REDIS_URL")
-db = redis.from_url(REDIS_URL, decode_responses=True)
+db = None
+
+try:
+    if REDIS_URL:
+        # Conexión con reintentos para estabilidad en la nube
+        db = redis.from_url(
+            REDIS_URL, 
+            decode_responses=True, 
+            socket_timeout=10,
+            retry_on_timeout=True
+        )
+        db.ping()
+        print("✅ CONEXIÓN EXITOSA A REDIS")
+    else:
+        print("❌ ERROR: Variable REDIS_URL no encontrada.")
+except Exception as e:
+    print(f"⚠️ FALLO DE CONEXIÓN A REDIS: {e}")
+    db = None
 
 bot = telebot.TeleBot(TOKEN)
 
@@ -26,43 +43,52 @@ SYMBOLS = {
     "QQQ": "qqq.us"
 }
 
-# ================= GESTIÓN DE DATOS (REDIS) =================
+# ================= GESTIÓN DE DATOS (REDIS / BACKUP) =================
 def load_data():
-    stored = db.get("user_data")
-    if stored:
-        return json.loads(stored)
-    else:
-        # Valores iniciales si la base de datos está vacía
-        initial = {
-            "saldo": 0,
-            "portfolio": {
-                "NVIDIA": {"units": 0.62, "avg_price": 178.41},
-                "Tesla": {"units": 0.13, "avg_price": 382.06},
-                "SPY": {"units": 0.14, "avg_price": 657.52},
-                "QQQ": {"units": 0.05, "avg_price": 603.10}
-            }
+    # Intentar cargar desde Redis
+    if db:
+        try:
+            stored = db.get("user_data")
+            if stored:
+                return json.loads(stored)
+        except Exception as e:
+            print(f"Error leyendo de Redis: {e}")
+    
+    # Valores por defecto si falla Redis o es la primera vez
+    return {
+        "saldo": 0,
+        "portfolio": {
+            "NVIDIA": {"units": 0.62, "avg_price": 178.41},
+            "Tesla": {"units": 0.13, "avg_price": 382.06},
+            "SPY": {"units": 0.14, "avg_price": 657.52},
+            "QQQ": {"units": 0.05, "avg_price": 603.10}
         }
-        db.set("user_data", json.dumps(initial))
-        return initial
+    }
 
 def save_data(current_data):
-    db.set("user_data", json.dumps(current_data))
+    if db:
+        try:
+            db.set("user_data", json.dumps(current_data))
+        except Exception as e:
+            print(f"Error guardando en Redis: {e}")
 
-# Cargar datos al iniciar
+# Cargar datos iniciales
 user_data = load_data()
 
-# ================= MOTOR DE MERCADO =================
+# ================= MOTOR DE MERCADO (STOOQ) =================
 def get_price(symbol):
     try:
+        # User-Agent para evitar bloqueos de Stooq
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         url = f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, headers=headers, timeout=15)
+        
         if r.status_code == 200:
             lines = r.text.strip().split("\n")
             if len(lines) > 1:
-                price = lines[1].split(",")[6]
-                if price != 'N/A':
-                    return round(float(price), 2)
+                price_str = lines[1].split(",")[6]
+                if price_str != 'N/A':
+                    return round(float(price_str), 2)
         return None
     except:
         return None
@@ -87,17 +113,17 @@ def menu():
 
 @bot.message_handler(commands=['start'])
 def start(msg):
-    bot.send_message(msg.chat.id, "🚀 Bot de Inversiones con Redis Activo", reply_markup=menu())
+    bot.send_message(msg.chat.id, "🚀 SmartBot Inversiones (Redis) Activo", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "📊 Portafolio")
 def portfolio(msg):
-    # Recargar datos de Redis para estar sincronizados
-    curr_data = load_data()
+    # Recargar datos frescos de Redis
+    data = load_data()
     text = "📊 **TU PORTAFOLIO**\n" + "—" * 15 + "\n"
-    total_market_val = 0
+    total_market = 0
     total_invested = 0
 
-    for asset, p in curr_data["portfolio"].items():
+    for asset, p in data["portfolio"].items():
         price = get_price(SYMBOLS[asset])
         if price:
             val = p["units"] * price
@@ -105,19 +131,19 @@ def portfolio(msg):
             profit = val - invested
             profit_pct = (profit / invested) * 100
             
-            total_market_val += val
+            total_market += val
             total_invested += invested
             
             emoji = "🟢" if profit >= 0 else "🔴"
             text += f"🔹 **{asset}**: ${price}\n"
             text += f"   Valor: ${round(val,2)} ({emoji} {round(profit_pct,1)}%)\n"
         else:
-            text += f"🔹 **{asset}**: Precio no disp.\n"
+            text += f"🔹 **{asset}**: Precio N/D\n"
 
-    total_profit_pct = ((total_market_val - total_invested) / total_invested) * 100 if total_invested > 0 else 0
-    text += "—" * 15 + f"\n💰 **Total Acciones:** ${round(total_market_val,2)}\n"
-    text += f"📈 **Rendimiento Global:** {round(total_profit_pct,2)}%\n"
-    text += f"💵 **Saldo Cash:** ${curr_data['saldo']}"
+    total_pct = ((total_market - total_invested) / total_invested) * 100 if total_invested > 0 else 0
+    text += "—" * 15 + f"\n💰 **Total Acciones:** ${round(total_market,2)}\n"
+    text += f"📈 **Rendimiento Global:** {round(total_pct,2)}%\n"
+    text += f"💵 **Saldo Cash:** ${data['saldo']}"
     
     bot.send_message(msg.chat.id, text, parse_mode="Markdown")
 
@@ -131,24 +157,24 @@ def market(msg):
 
 @bot.message_handler(func=lambda m: m.text == "💰 Actualizar saldo")
 def ask_saldo(msg):
-    bot.send_message(msg.chat.id, "Envíame el comando: `saldo 100`", parse_mode="Markdown")
+    bot.send_message(msg.chat.id, "Escribe: `saldo 100`", parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text.startswith("saldo"))
 def set_saldo(msg):
     try:
         new_val = float(msg.text.split()[1])
-        curr_data = load_data()
-        curr_data["saldo"] = new_val
-        save_data(curr_data)
-        bot.send_message(msg.chat.id, f"✅ Saldo en Redis actualizado: ${new_val}")
+        data = load_data()
+        data["saldo"] = new_val
+        save_data(data)
+        bot.send_message(msg.chat.id, f"✅ Saldo guardado en Redis: ${new_val}")
     except:
-        bot.send_message(msg.chat.id, "❌ Error. Usa: saldo 50")
+        bot.send_message(msg.chat.id, "❌ Error. Formato: `saldo 50`", parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "🧠 Recomendación")
 def recomendacion(msg):
-    curr_data = load_data()
+    data = load_data()
     text = "🧠 **ANÁLISIS DE ESTRATEGIA**\n\n"
-    for asset, p in curr_data["portfolio"].items():
+    for asset, p in data["portfolio"].items():
         price = get_price(SYMBOLS[asset])
         trend, action = analyze(price, p["avg_price"])
         text += f"● **{asset}**\n   Tendencia: {trend}\n   Acción: `{action}`\n\n"
@@ -159,7 +185,7 @@ def alert_loop():
     while True:
         try:
             if CHAT_ID:
-                text = "🔔 **REPORTE AUTOMÁTICO**\n"
+                text = "🔔 **REPORTE HORARIO**\n"
                 for name, sym in SYMBOLS.items():
                     p = get_price(sym)
                     text += f"{name}: ${p}\n"
@@ -168,8 +194,10 @@ def alert_loop():
         except:
             time.sleep(60)
 
-# ================= EJECUCIÓN =================
+# ================= INICIO =================
 if __name__ == "__main__":
-    print("Bot Iniciado con Redis...")
+    print("Bot Iniciado...")
+    # Hilo para alertas en paralelo
     threading.Thread(target=alert_loop, daemon=True).start()
+    # Polling infinito
     bot.infinity_polling()
