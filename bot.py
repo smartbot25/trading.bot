@@ -185,14 +185,36 @@ def alert_loop():
     while True:
         try:
             if CHAT_ID:
-                text = "🔔 **REPORTE HORARIO**\n"
-                for name, sym in SYMBOLS.items():
-                    p = get_price(sym)
-                    text += f"{name}: ${p}\n"
-                bot.send_message(CHAT_ID, text, parse_mode="Markdown")
-            time.sleep(3600) 
-        except:
+                data = load_data()
+                total_market = 0
+                total_invested = 0
+                
+                # Calculamos el estado actual
+                for asset, p in data["portfolio"].items():
+                    price = get_price(SYMBOLS[asset])
+                    if price:
+                        total_market += (p["units"] * price)
+                        total_invested += (p["units"] * p["avg_price"])
+
+                # Calculamos rendimiento global
+                if total_invested > 0:
+                    total_pct = ((total_market - total_invested) / total_invested) * 100
+                    
+                    # --- CRITERIO DE ALERTA DE PÁNICO ---
+                    # Si la caída global es peor al -8% (puedes cambiar este número)
+                    if total_pct <= -8.0:
+                        msg = "⚠️ **¡ALERTA DE PÁNICO!** ⚠️\n\n"
+                        msg += f"Tu portafolio ha caído un **{round(total_pct, 2)}%**.\n"
+                        msg += "El mercado está sufriendo una corrección fuerte. Revisa tus posiciones."
+                        bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
+                
+                # Reporte normal cada 4 horas para no saturar Railway
+                # (Cambiamos de 1h a 4h para ahorrar créditos)
+                time.sleep(14400) 
+        except Exception as e:
+            print(f"Error en alerta: {e}")
             time.sleep(60)
+
 # ================= COMANDO DE COMPRA (DCA) =================
 @bot.message_handler(func=lambda m: m.text == "🛒 Registrar Compra")
 def ask_buy(msg):
