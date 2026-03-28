@@ -162,13 +162,26 @@ def ask_saldo(msg):
 @bot.message_handler(func=lambda m: m.text.startswith("saldo"))
 def set_saldo(msg):
     try:
-        new_val = float(msg.text.split()[1])
+        # Extraemos el número del mensaje (ej: "saldo 35")
+        partes = msg.text.split()
+        if len(partes) < 2:
+	    raise ValueError("Falta el número")
+
+        new_val = float(partes[1])
+
+        # 1. Cargamos lo que hay en Redis actualmente
         data = load_data()
+        
+        # 2. Modificamos solo el saldo
         data["saldo"] = new_val
+        
+        # 3. GUARDADO CRÍTICO: Forzamos el guardado en Rdis
         save_data(data)
-        bot.send_message(msg.chat.id, f"✅ Saldo guardado en Redis: ${new_val}")
+        
+        bot.send_message(msg.chat.id, f"✅ **Saldo Actualizado:**\nAhora tienes `${new_val}` para invertir.", parse_mode="Markdown")
+
     except:
-        bot.send_message(msg.chat.id, "❌ Error. Formato: `saldo 50`", parse_mode="Markdown")
+        bot.send_message(msg.chat.id, "❌ **Error de Formato.**\nEscribe: `saldo 35` (usa punto para decimales, ej: `saldo 35.50`)")
 
 @bot.message_handler(func=lambda m: m.text == "🧠 Recomendación")
 def recomendacion(msg):
