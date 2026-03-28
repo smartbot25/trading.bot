@@ -173,11 +173,41 @@ def set_saldo(msg):
 @bot.message_handler(func=lambda m: m.text == "🧠 Recomendación")
 def recomendacion(msg):
     data = load_data()
-    text = "🧠 **ANÁLISIS DE ESTRATEGIA**\n\n"
+    # Obtenemos el saldo que registraste con el comando "saldo X"
+    saldo_cash = data.get("saldo", 0)
+    
+    text = "🧠 **ASISTENTE DE EJECUCIÓN TYBA**\n"
+    text += f"💵 Efectivo en cuenta: `${saldo_cash}`\n"
+    text += "—" * 20 + "\n\n"
+    
+    hay_oportunidad = False
+
     for asset, p in data["portfolio"].items():
         price = get_price(SYMBOLS[asset])
         trend, action = analyze(price, p["avg_price"])
-        text += f"● **{asset}**\n   Tendencia: {trend}\n   Acción: `{action}`\n\n"
+        
+        # Filtramos solo cuando el análisis dice "COMPRA"
+        if "COMPRA" in action and price and saldo_cash > 0:
+            hay_oportunidad = True
+            
+            # Cálculo: Usamos el 25% del saldo para esta operación
+            monto_invertir = saldo_cash * 0.25
+            unidades_a_comprar = monto_invertir / price
+            
+            text += f"🚨 **OPORTUNIDAD DETECTADA: {asset}**\n"
+            text += f"📊 Estado: {trend}\n\n"
+            text += f"👉 **INSTRUCCIONES PARA TYBA:**\n"
+            text += f"1️⃣ Busca el activo: **{asset}**\n"
+            text += f"2️⃣ Cantidad a comprar: `{round(unidades_a_comprar, 4)}` unidades\n"
+            text += f"3️⃣ Monto aproximado a pagar: `${round(monto_invertir, 2)}` \n"
+            text += "—" * 15 + "\n"
+            
+    if not hay_oportunidad:
+        if saldo_cash <= 0:
+            text += "❌ **Sin Saldo:** No puedo calcular compras. Usa el botón 'Actualizar saldo' primero."
+        else:
+            text += "⚖️ **Mercado Estable:** No hay órdenes de compra sugeridas por ahora. ¡Buen trabajo manteniendo el Hold!"
+
     bot.send_message(msg.chat.id, text, parse_mode="Markdown")
 
 # ================= MONITOR DE ALERTAS (HILO) =================
